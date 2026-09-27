@@ -7,6 +7,7 @@ person_process.py — Detect người + tracking + đếm vượt vạch. Một 
   - Bộ lọc chống rung theo tổng dịch chuyển quỹ đạo (MIN_PATH_MOVEMENT_PIXELS).
   - Không bao giờ đếm trùng (mỗi track ID đếm đúng 1 lần).
 """
+import concurrent.futures
 import logging
 import queue
 import time
@@ -25,7 +26,7 @@ from utils.line_crossing import (
     path_net_displacement,
     segments_intersect,
 )
-from utils.helper import normalize_person_class
+from utils.helper import normalize_person_class, save_counted_person_images, cleanup_old_images
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +274,14 @@ class PersonProcessor:
         }
         self._stats_at = time.time()
 
+        # Thread pool ghi file ảnh bất đồng bộ ra thư mục chung
+        workers = max(1, int(getattr(settings, "IMAGE_WRITER_WORKERS", 2)))
+        self.image_writer_pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix=f"img-writer-{self.cam_name}"
+        )
+        self._last_cleanup_at = time.time()
+
     def detect_person(self, frame):
         return self.client.detect_person_yolo(frame)
 
@@ -343,12 +352,20 @@ class PersonProcessor:
             if item is _EOS:
                 break
 
-            _frame_time, _frame_id, frame, frame_count = item
+            _frame_time, frame_uuid, frame, frame_count = item
             if frame is None:
                 continue
             self._resolve_line(frame)
 
             now = time.time()
+            # Định kỳ kích hoạt dọn dẹp ảnh cũ (mỗi 24 giờ một lần)
+            if now - self._last_cleanup_at > 86400:
+                self._last_cleanup_at = now
+                try:
+                    self.image_writer_pool.submit(cleanup_old_images)
+                except Exception:
+                    pass
+
             if self._detect_interval > 0:
                 do_detect = now >= self._next_detect_at
                 if do_detect:
@@ -358,9 +375,9 @@ class PersonProcessor:
                 do_detect = skip <= 1 or (frame_count % skip == 1)
 
             if do_detect:
-                tracked_objects = self._detect_round(tracked_objects, frame, frame_count)
+                tracked_objects = self._detect_round(tracked_objects, frame, frame_count, frame_uuid=frame_uuid)
             else:
-                tracked_objects = self._track_round(tracked_objects, frame)
+                tracked_objects = self._track_round(tracked_objects, frame, frame_uuid=frame_uuid)
 
             self._log_stats_if_due(len(tracked_objects))
 
@@ -368,7 +385,7 @@ class PersonProcessor:
                     f"{self.total_counted} người đã đếm, "
                     f"{len(tracked_objects)} track còn trên tay")
 
-    def _detect_round(self, tracked_objects, frame, frame_count):
+    def _detect_round(self, tracked_objects, frame, frame_count, frame_uuid=None):
         try:
             dets = self.detect_person(frame)
         except Exception as exc:
@@ -396,10 +413,10 @@ class PersonProcessor:
         matched_dets = set()
         matched_objs = set()
         self._match_by_iou(tracked_objects, detections, frame, frame_count,
-                           matched_dets, matched_objs)
+                           matched_dets, matched_objs, frame_uuid=frame_uuid)
         if settings.MATCH_BY_DISTANCE:
             self._match_by_distance(tracked_objects, detections, frame, frame_count,
-                                    matched_dets, matched_objs)
+                                    matched_dets, matched_objs, frame_uuid=frame_uuid)
 
         survivors = [obj for obj in tracked_objects if id(obj) in matched_objs]
 
@@ -412,7 +429,7 @@ class PersonProcessor:
                 self._stats["expired"] += 1
                 continue
             obj.predict_forward(frame.shape)
-            self._check_line_crossing(obj)
+            self._check_line_crossing(obj, frame=frame, frame_uuid=frame_uuid)
             survivors.append(obj)
 
         for det_idx, (det_bbox, conf, cls) in enumerate(detections):
@@ -433,7 +450,7 @@ class PersonProcessor:
         return ratio <= float(settings.MATCH_MAX_AREA_RATIO)
 
     def _match_by_iou(self, tracked_objects, detections, frame, frame_count,
-                      matched_dets, matched_objs):
+                      matched_dets, matched_objs, frame_uuid=None):
         threshold = float(settings.MATCH_IOU_THRESHOLD)
         pairs = []
         for det_idx, (det_bbox, _conf, _cls) in enumerate(detections):
@@ -451,11 +468,11 @@ class PersonProcessor:
             matched_dets.add(det_idx)
             matched_objs.add(id(obj))
             det_bbox, conf, cls = detections[det_idx]
-            self._apply_match(obj, det_bbox, conf, cls, frame, frame_count)
+            self._apply_match(obj, det_bbox, conf, cls, frame, frame_count, frame_uuid=frame_uuid)
             self._stats["matched_iou"] += 1
 
     def _match_by_distance(self, tracked_objects, detections, frame, frame_count,
-                           matched_dets, matched_objs):
+                           matched_dets, matched_objs, frame_uuid=None):
         factor = float(settings.MATCH_DISTANCE_FACTOR)
         pairs = []
         for det_idx, (det_bbox, _conf, _cls) in enumerate(detections):
@@ -478,10 +495,10 @@ class PersonProcessor:
             matched_dets.add(det_idx)
             matched_objs.add(id(obj))
             det_bbox, conf, cls = detections[det_idx]
-            self._apply_match(obj, det_bbox, conf, cls, frame, frame_count)
+            self._apply_match(obj, det_bbox, conf, cls, frame, frame_count, frame_uuid=frame_uuid)
             self._stats["matched_distance"] += 1
 
-    def _apply_match(self, obj, det_bbox, conf, cls, frame, frame_count):
+    def _apply_match(self, obj, det_bbox, conf, cls, frame, frame_count, frame_uuid=None):
         last = obj.last_update_frame or (frame_count - 1)
         frames_passed = max(1, frame_count - last)
         dx = (det_bbox[0] - obj.bbox[0]) / float(frames_passed)
@@ -496,16 +513,16 @@ class PersonProcessor:
         obj.frame_count += 1
         obj.update_position(det_bbox)
         obj.compute_hog_descriptor(frame)
-        self._check_line_crossing(obj)
+        self._check_line_crossing(obj, frame=frame, frame_uuid=frame_uuid)
 
-    def _track_round(self, tracked_objects, frame):
+    def _track_round(self, tracked_objects, frame, frame_uuid=None):
         for obj in tracked_objects:
             search_by_hog(obj, frame)
             obj.frame_count += 1
-            self._check_line_crossing(obj)
+            self._check_line_crossing(obj, frame=frame, frame_uuid=frame_uuid)
         return tracked_objects
 
-    def _check_line_crossing(self, obj):
+    def _check_line_crossing(self, obj, frame=None, frame_uuid=None):
         """Đếm người khi quỹ đạo chân hoặc tâm cắt qua vạch.
         Dùng dot product với direction vector để phân biệt IN/OUT.
         """
@@ -560,6 +577,27 @@ class PersonProcessor:
         dot_str = f"dot={dot_val:.2f}" if dot_val is not None else "no_dir"
         logger.info(f"[{self.cam_name}] VƯỢT VẠCH {direction_label} ({dot_str}) — người #{obj.id} "
                     f"conf={conf:.2f} bbox={obj.bbox} frames={obj.frame_count}")
+
+        # Kích hoạt lưu ảnh người được đếm vào thư mục dùng chung (bất đồng bộ)
+        if getattr(settings, "ENABLE_SAVE_IMAGE", True) and frame is not None:
+            try:
+                frame_snap = frame.copy()
+                line_pts = list(self._line_points) if self._line_points else None
+                dir_vec = tuple(self._direction_vector) if self._direction_vector else None
+                self.image_writer_pool.submit(
+                    save_counted_person_images,
+                    frame=frame_snap,
+                    obj=obj,
+                    line_points=line_pts,
+                    direction_vector=dir_vec,
+                    direction_label=direction_label,
+                    cam_id=self.stream_id,
+                    frame_uuid=frame_uuid,
+                    cam_name=self.cam_name,
+                )
+            except Exception as e:
+                logger.warning(f"[{self.cam_name}] Không thể submit tác vụ lưu ảnh: {e}")
+
         if self.counting_callback:
             try:
                 self.counting_callback(person_class)
@@ -588,6 +626,13 @@ class PersonProcessor:
         for key in s:
             s[key] = 0
         self._stats_at = now
+
+    def stop(self):
+        """Dừng image_writer_pool an toàn."""
+        try:
+            self.image_writer_pool.shutdown(wait=False)
+        except Exception:
+            pass
 
 
 # Alias để tương thích

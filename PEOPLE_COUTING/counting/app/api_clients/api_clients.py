@@ -12,6 +12,7 @@ Every orchestrator service talks to the same CMS endpoints:
   POST   /api/camera-statistics[/batch] — push counting statistics
   POST   {INSPECTION}/check          — expired-inspection lookup (LPR only)
 """
+import base64
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -103,20 +104,81 @@ def patch_camera(stream_id: str, online: int):
 
 
 # ── alarms / events ───────────────────────────────────────────────────
-def create_alarm(stream_id: str, type: str, source: str, attributes: dict = None):
+def create_alarm(stream_id: str, type: str, source: str, attributes: dict = None,
+                 frame=None, image_base64: str = None):
     url = f"{settings.BASE_URL.rstrip('/')}/api/alarms"
+    attrs = dict(attributes or {})
     payload = {
         'stream_id': stream_id,
         'type': type,
         'source': source,
-        'attributes': attributes or {},
+        'attributes': attrs,
         'time': datetime.now(timezone(timedelta(hours=7))).timestamp()  # UTC+7
     }
+
+    if image_base64:
+        payload["image_base64"] = image_base64
+    elif frame is not None:
+        try:
+            import cv2
+            h, w = frame.shape[:2]
+            if w > 1280 or h > 720:
+                scale = min(1280 / w, 720 / h)
+                nw, nh = int(w * scale), int(h * scale)
+                frame_to_enc = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            else:
+                frame_to_enc = frame
+            quality = int(getattr(settings, 'JPEG_QUALITY', 75))
+            ok, buf = cv2.imencode(".jpg", frame_to_enc, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+            if ok:
+                payload["image_base64"] = base64.b64encode(buf.tobytes()).decode("ascii")
+        except Exception as e:
+            logger.warning(f"Lỗi encode image_base64 cho alarm: {e}")
+
     resp = session.post(url, json=payload, headers=_headers(),
                         verify=False, timeout=(10.0, 20.0))
-    logger.info(f"STATUS-CREATE-ALARM: {resp.status_code}")
+    logger.info(f"STATUS-CREATE-ALARM: {resp.status_code} | type={type} | stream={stream_id}")
     resp.raise_for_status()
     return resp.json()
+
+
+def send_person_counting_event(
+    stream_id: str,
+    direction: str,
+    bbox: list,
+    conf: float,
+    track_id: int,
+    frame_id: str,
+    frame=None,
+    image_base64: str = None,
+    cam_name: str = None,
+):
+    """
+    Bắn sự kiện đếm người (kèm ảnh evidence) lên CMS qua POST /api/alarms.
+    C# desktop client (Kabe VMS) sẽ nhận realtime và hiển thị trong danh sách thẻ ảnh
+    (Tìm kiếm AI -> Đếm người).
+    """
+    action = "enter" if str(direction).lower() in ("in", "enter") else "exit"
+    dir_str = "in" if action == "enter" else "out"
+    attrs = {
+        "direction": dir_str,
+        "action": action,
+        "name": "person",
+        "class_name": "person",
+        "bbox": bbox,
+        "conf": round(float(conf), 4),
+        "frame_id": frame_id,
+        "track_id": int(track_id),
+        "camera_name": cam_name or stream_id,
+    }
+    return create_alarm(
+        stream_id=stream_id,
+        type="people_counting",
+        source=stream_id,
+        attributes=attrs,
+        frame=frame,
+        image_base64=image_base64,
+    )
 
 
 def get_event(type: str):

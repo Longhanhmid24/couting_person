@@ -47,16 +47,25 @@ class Settings:
     GRPC_MAX_RETRIES = int(os.getenv("GRPC_MAX_RETRIES", 2))
     GRPC_RETRY_DELAY = float(os.getenv("GRPC_RETRY_DELAY", 0.2))
 
-    # Path
+    # Path & Image Saving (Shared Storage)
     ROOT_PATH = os.getenv(
         "ROOT_PATH",
         os.path.abspath(os.path.join(os.path.dirname(__file__), "..")),
     )
     SAVE_IMAGE_DIR = os.getenv("SAVE_IMAGE_DIR", os.path.join(ROOT_PATH, "images"))
+    ENABLE_SAVE_IMAGE = _flag("ENABLE_SAVE_IMAGE", "True")
+    IMAGE_STORAGE_MODE = os.getenv("IMAGE_STORAGE_MODE", "both").lower()  # "uuid", "hierarchy", "both"
+    SAVE_PERSON_CROP = _flag("SAVE_PERSON_CROP", "True")
+    JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", 75))
+    MAX_IMAGE_WIDTH = int(os.getenv("MAX_IMAGE_WIDTH", 1280))
+    MAX_IMAGE_HEIGHT = int(os.getenv("MAX_IMAGE_HEIGHT", 720))
+    IMAGE_RETENTION_DAYS = int(os.getenv("IMAGE_RETENTION_DAYS", 30))
+    IMAGE_WRITER_WORKERS = int(os.getenv("IMAGE_WRITER_WORKERS", 2))
 
-    # Decode
+    # Decode & Health
     FORCE_CPU_DECODE = _flag("FORCE_CPU_DECODE")
     TARGET_FPS = int(os.getenv("TARGET_FPS", 25))
+    ENABLE_PATCH_OFFLINE = _flag("ENABLE_PATCH_OFFLINE", "False")
 
     # ── Nhịp detect ───────────────────────────────────────────────────
     DETECT_FPS = float(os.getenv("DETECT_FPS", 10))

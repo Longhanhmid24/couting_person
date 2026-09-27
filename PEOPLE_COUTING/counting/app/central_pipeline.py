@@ -40,21 +40,18 @@ def parse_camera_params(cam: dict, rules: list = None):
     )
 
     line_config = rule_cfg.get("line")
+    direction_config = _find_direction_filter(cam_id, rules)
+
     if not line_config:
         LOGGER.warning(
-            f"[{cam_name}] ⚠️ Chưa cấu hình counting line — bỏ qua camera"
+            f"[{cam_name}] ⚠️ Chưa cấu hình counting line — reader vẫn chạy để kết nối và phát live stream, "
+            f"sẽ tự động đếm người khi vạch được kẻ trên CMS UI."
         )
-        return None
-
-    # Đọc trực tiếp danh sách filter từ rules API để kiểm tra có filter type="direction" riêng biệt
-    # (không dùng rule_cfg.get("direction") vì helper.py fallback copy line → direction)
-    direction_config = _find_direction_filter(cam_id, rules)
-    if not direction_config:
+    elif not direction_config:
         LOGGER.warning(
-            f"[{cam_name}] ⚠️ Chưa kẻ hướng đếm (direction) — bỏ qua camera. "
-            f"Vui lòng vẽ mũi tên hướng trên CMS UI."
+            f"[{cam_name}] ⚠️ Chưa kẻ hướng đếm (direction) — "
+            f"vui lòng vẽ mũi tên hướng trên CMS UI để phân biệt IN/OUT."
         )
-        return None
 
     return {"line_config": line_config, "direction_config": direction_config}
 
@@ -198,6 +195,12 @@ class CameraPipelineInstance:
 
         if self.t_person and self.t_person.is_alive():
             self.t_person.join(timeout=10.0)
+
+        if hasattr(self, 'person_processor') and self.person_processor is not None:
+            try:
+                self.person_processor.stop()
+            except Exception:
+                pass
 
         self.shutdown_flag.set()
         if self.t_stats and self.t_stats.is_alive():

@@ -42,6 +42,31 @@ def _motion_param(name: str, default, cast):
         return cast(default)
 
 
+def get_rtsp_url(cam: dict) -> str:
+    """Xây dựng RTSP URL từ config camera CMS tương tự bên long_dev.
+    Hỗ trợ tự động fallback port 554 khi người dùng nhập port web/SDK (8888, 37777).
+    """
+    raw_url = cam.get("url") or ""
+    if raw_url.startswith("rtsp://") or raw_url.startswith("http://") or raw_url.startswith("https://"):
+        return raw_url
+
+    storage_url = cam.get("storage_url")
+    if storage_url and str(storage_url).strip() and str(storage_url).strip().lower() != "null":
+        username = cam.get("storage_username") or "admin"
+        password = cam.get("storage_password") or ""
+        channel = cam.get("storage_channel") or 1
+        port = cam.get("storage_port") or 554
+        try:
+            port = int(port)
+            if port not in (554, 5544, 8554):
+                port = 554
+        except Exception:
+            port = 554
+        return f"rtsp://{username}:{password}@{storage_url}:{port}/cam/realmonitor?channel={channel}&subtype=0"
+
+    return ""
+
+
 class CentralEngine:
     """Orchestrates all camera readers and the central processing pipeline."""
 
@@ -172,9 +197,9 @@ class CentralEngine:
             return
 
         use_sdk = cam.get('use_sdk', 0)
-        rtsp_url = cam.get('url', '')
-        if not rtsp_url and use_sdk != 1:
-            LOGGER.warning(f"[{cam_name}] Skipped: no RTSP url provided and use_sdk != 1")
+        rtsp_url = get_rtsp_url(cam)
+        if not rtsp_url and use_sdk != 1 and not cam.get('storage_url'):
+            LOGGER.warning(f"[{cam_name}] Skipped: no RTSP url and no storage_url provided")
             return
 
         # Check if camera is explicitly disabled (status is 0 or False)
@@ -294,6 +319,9 @@ class CentralEngine:
         - Không patch lại giá trị đã đúng: tránh spam CMS và tránh nháy trên UI.
         - Patch thất bại thì KHÔNG ghi cache, để vòng poll sau thử lại.
         """
+        if online == 0 and not getattr(settings, 'ENABLE_PATCH_OFFLINE', False):
+            # Không tự động hạ offline camera trên CMS, tránh làm camera biến thành Offline trên UI khi đang retry
+            return
         if self._shutting_down:
             LOGGER.info(f"[{cam_id[:8]}] Đang tắt service — giữ nguyên trạng thái "
                         f"CMS (bỏ qua patch online={online})")

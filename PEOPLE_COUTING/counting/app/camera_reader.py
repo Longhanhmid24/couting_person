@@ -1164,18 +1164,17 @@ def create_reader(cam_id: str, cam_config: dict,
             channel=int(cam_config['storage_channel']) if cam_config.get('storage_channel') else 1,
             codec=codec,
         )
-        if manufacturer == 'dahua':
-            return DahuaAutoReader(
-                cam_id, output_queue, shutdown_event,
-                name=cam_name, gpuid=gpuid, **sdk_kw, **motion_kw)
-        elif manufacturer == 'hik':
+        if manufacturer in ('hik', 'hikvision'):
             rtsp_url = cam_config.get('url') or ''
             return HIKAutoReader(
                 cam_id, output_queue, shutdown_event,
                 rtsp_url=rtsp_url, name=cam_name, gpuid=gpuid,
                 **sdk_kw, **motion_kw)
         else:
-            LOGGER.warning(f"Unknown manufacturer '{manufacturer}', using RTSP fallback")
+            # Dahua, KBVision, Kabevision, Kabe và các hãng OEM Dahua đều dùng Dahua SDK
+            return DahuaAutoReader(
+                cam_id, output_queue, shutdown_event,
+                name=cam_name, gpuid=gpuid, **sdk_kw, **motion_kw)
 
     # RTSP mode
     rtsp_url = cam_config.get('url', '')

@@ -2,6 +2,7 @@ from time_uuid import TimeUUID
 import os, re, json, logging, requests
 from core.settings import settings
 import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +141,10 @@ def save_image_with_uuid(uuid_str, image, quality):
         os.makedirs(os.path.dirname(path), mode=0o777, exist_ok=True)
         success = cv2.imwrite(path, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
         if success:
+            try:
+                os.chmod(path, 0o666)
+            except Exception:
+                pass
             return path
     except Exception as e:
         logger.warning(f"Failed to write image to {path}: {e}")
@@ -150,6 +155,10 @@ def save_image_with_uuid(uuid_str, image, quality):
         os.makedirs(fallback_dir, mode=0o777, exist_ok=True)
         fallback_path = os.path.join(fallback_dir, f"{uuid_str}.jpg")
         cv2.imwrite(fallback_path, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        try:
+            os.chmod(fallback_path, 0o666)
+        except Exception:
+            pass
         return fallback_path
     except Exception as ex:
         logger.error(f"Fallback image write also failed for {uuid_str}: {ex}")
@@ -160,12 +169,266 @@ def save_frame_with_name(name_frame: str, image, quality=95):
     try:
         os.makedirs(os.path.dirname(path), mode=0o777, exist_ok=True)
         cv2.imwrite(path, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        try:
+            os.chmod(path, 0o666)
+        except Exception:
+            pass
         return path
     except Exception as e:
         fallback_path = os.path.join(settings.ROOT_PATH, "images", f"{name_frame}.jpg")
         os.makedirs(os.path.dirname(fallback_path), mode=0o777, exist_ok=True)
         cv2.imwrite(fallback_path, image, [cv2.IMWRITE_JPEG_QUALITY, quality])
+        try:
+            os.chmod(fallback_path, 0o666)
+        except Exception:
+            pass
         return fallback_path
+
+def draw_person_counting_evidence(frame: np.ndarray, obj, line_points=None,
+                                  direction_vector=None, direction_label: str = "IN",
+                                  max_w: int = 1280, max_h: int = 720) -> np.ndarray:
+    """Vẽ ảnh bằng chứng khoảnh khắc người vượt qua vạch đếm."""
+    if frame is None:
+        return None
+    evidence = frame.copy()
+    h_orig, w_orig = evidence.shape[:2]
+
+    # 1. Vẽ vạch đếm (Counting Line) màu vàng nét đậm
+    if line_points and len(line_points) >= 2:
+        try:
+            pt1 = (int(round(line_points[0][0])), int(round(line_points[0][1])))
+            pt2 = (int(round(line_points[1][0])), int(round(line_points[1][1])))
+            cv2.line(evidence, pt1, pt2, (0, 255, 255), 3, cv2.LINE_AA)
+            cv2.circle(evidence, pt1, 5, (0, 200, 255), -1, cv2.LINE_AA)
+            cv2.circle(evidence, pt2, 5, (0, 200, 255), -1, cv2.LINE_AA)
+
+            mid_x = (pt1[0] + pt2[0]) // 2
+            mid_y = (pt1[1] + pt2[1]) // 2
+            cv2.putText(evidence, "COUNTING LINE", (mid_x - 40, max(20, mid_y - 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+        except Exception as e:
+            logger.debug(f"Lỗi vẽ vạch đếm: {e}")
+
+    # 2. Vẽ vector hướng (Direction Arrow) nếu có
+    if direction_vector is not None and line_points and len(line_points) >= 2:
+        try:
+            mid_x = (line_points[0][0] + line_points[1][0]) / 2.0
+            mid_y = (line_points[0][1] + line_points[1][1]) / 2.0
+            vx, vy = direction_vector
+            norm = (vx ** 2 + vy ** 2) ** 0.5
+            if norm > 1e-6:
+                arr_len = 50.0
+                ax = int(round(mid_x + (vx / norm) * arr_len))
+                ay = int(round(mid_y + (vy / norm) * arr_len))
+                cv2.arrowedLine(evidence, (int(round(mid_x)), int(round(mid_y))),
+                                (ax, ay), (255, 100, 0), 2, tipLength=0.3)
+        except Exception:
+            pass
+
+    # 3. Vẽ quỹ đạo di chuyển (path bottom)
+    if hasattr(obj, 'path_bottom') and obj.path_bottom:
+        pts = [p for p in obj.path_bottom if p is not None]
+        for i in range(len(pts) - 1):
+            p1 = (int(round(pts[i][0])), int(round(pts[i][1])))
+            p2 = (int(round(pts[i + 1][0])), int(round(pts[i + 1][1])))
+            cv2.line(evidence, p1, p2, (255, 255, 0), 2, cv2.LINE_AA)
+            cv2.circle(evidence, p1, 3, (0, 255, 255), -1, cv2.LINE_AA)
+        if pts:
+            last_p = (int(round(pts[-1][0])), int(round(pts[-1][1])))
+            cv2.circle(evidence, last_p, 4, (0, 0, 255), -1, cv2.LINE_AA)
+
+    # 4. Vẽ Bounding Box người được đếm
+    bx, by, bw, bh = obj.bbox
+    x1, y1 = max(0, int(bx)), max(0, int(by))
+    x2, y2 = min(w_orig, int(bx + bw)), min(h_orig, int(by + bh))
+
+    is_in = (direction_label.upper() == "IN")
+    box_color = (0, 255, 0) if is_in else (0, 165, 255)  # Xanh lá = IN, Cam = OUT
+    cv2.rectangle(evidence, (x1, y1), (x2, y2), box_color, 2, cv2.LINE_AA)
+
+    # 5. Vẽ Badge Tag thông tin người được đếm
+    conf_str = f" {int(obj.conf * 100)}%" if getattr(obj, 'conf', None) else ""
+    tag_text = f"Person #{obj.id} [{direction_label}]{conf_str}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.55
+    thickness = 1
+    (tw, th), _baseline = cv2.getTextSize(tag_text, font, font_scale, thickness)
+
+    tag_y1 = max(0, y1 - th - 8)
+    tag_y2 = y1
+    tag_x2 = min(w_orig, x1 + tw + 10)
+    cv2.rectangle(evidence, (x1, tag_y1), (tag_x2, tag_y2), box_color, -1)
+    text_color = (0, 0, 0) if is_in else (255, 255, 255)
+    cv2.putText(evidence, tag_text, (x1 + 5, y1 - 5), font, font_scale, text_color, thickness, cv2.LINE_AA)
+
+    # 6. Resize tối ưu max 1280x720 nếu vượt quá
+    if max_w > 0 and max_h > 0 and (w_orig > max_w or h_orig > max_h):
+        scale = min(max_w / w_orig, max_h / h_orig)
+        nw, nh = int(round(w_orig * scale)), int(round(h_orig * scale))
+        evidence = cv2.resize(evidence, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    return evidence
+
+
+def crop_person_image(frame: np.ndarray, bbox, padding_ratio: float = 0.1) -> np.ndarray:
+    """Cắt ảnh cận cảnh dáng người với lề padding an toàn."""
+    if frame is None or bbox is None:
+        return None
+    try:
+        h, w = frame.shape[:2]
+        bx, by, bw, bh = bbox
+        pad_w = int(round(bw * padding_ratio))
+        pad_h = int(round(bh * padding_ratio))
+        x1 = max(0, int(bx - pad_w))
+        y1 = max(0, int(by - pad_h))
+        x2 = min(w, int(bx + bw + pad_w))
+        y2 = min(h, int(by + bh + pad_h))
+        if x2 > x1 and y2 > y1:
+            crop = frame[y1:y2, x1:x2].copy()
+            return crop
+    except Exception as e:
+        logger.debug(f"Lỗi crop ảnh người: {e}")
+    return None
+
+
+def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
+                               direction_vector=None, direction_label: str = "IN",
+                               cam_id: str = "camera", frame_uuid: str = None,
+                               cam_name: str = None) -> dict:
+    """Lưu ảnh evidence và crop của người vừa đếm vào thư mục dùng chung (Shared Storage),
+    đồng thời đẩy sự kiện kèm ảnh lên CMS qua POST /api/alarms."""
+    if not getattr(settings, 'ENABLE_SAVE_IMAGE', True) or frame is None:
+        return {}
+
+    from datetime import datetime, timezone, timedelta
+    import uuid as _uuid
+
+    tz_vn = timezone(timedelta(hours=7))
+    now_dt = datetime.now(tz_vn)
+    date_str = now_dt.strftime("%Y-%m-%d")
+    ts_int = int(now_dt.timestamp())
+
+    # Tạo frame_uuid nếu chưa có (dùng TimeUUID)
+    if not frame_uuid:
+        try:
+            node = _uuid.UUID(cam_id).node if isinstance(cam_id, str) and len(cam_id) == 36 else _uuid.getnode()
+            frame_uuid = str(_uuid.uuid1(node=node))
+        except Exception:
+            frame_uuid = str(_uuid.uuid4())
+
+    quality = max(30, min(100, int(getattr(settings, 'JPEG_QUALITY', 75))))
+    max_w = int(getattr(settings, 'MAX_IMAGE_WIDTH', 1280))
+    max_h = int(getattr(settings, 'MAX_IMAGE_HEIGHT', 720))
+    mode = str(getattr(settings, 'IMAGE_STORAGE_MODE', 'both')).lower().strip()
+    save_crop = getattr(settings, 'SAVE_PERSON_CROP', True)
+
+    evidence = draw_person_counting_evidence(
+        frame=frame,
+        obj=obj,
+        line_points=line_points,
+        direction_vector=direction_vector,
+        direction_label=direction_label,
+        max_w=max_w,
+        max_h=max_h
+    )
+    crop = crop_person_image(frame, obj.bbox) if save_crop else None
+
+    saved_paths = {"frame_uuid": frame_uuid}
+
+    # 1. Chế độ TimeUUID (Khớp chuẩn FileStorage CMS)
+    if mode in ("uuid", "both"):
+        try:
+            uuid_path = save_image_with_uuid(frame_uuid, evidence, quality)
+            saved_paths["uuid_path"] = uuid_path
+            if crop is not None:
+                crop_uuid = f"crop_{frame_uuid}"
+                crop_path = save_image_with_uuid(crop_uuid, crop, quality)
+                saved_paths["crop_uuid_path"] = crop_path
+        except Exception as e:
+            logger.warning(f"Lỗi lưu ảnh mode uuid: {e}")
+
+    # 2. Chế độ phân cấp theo Camera & Ngày tháng (Trực quan & Static serve)
+    if mode in ("hierarchy", "both"):
+        try:
+            base_dir = getattr(settings, 'SAVE_IMAGE_DIR', os.path.join(settings.ROOT_PATH, "images"))
+            target_dir = os.path.join(base_dir, str(cam_id), date_str)
+            os.makedirs(target_dir, mode=0o777, exist_ok=True)
+
+            fname = f"{ts_int}_{direction_label}_track_{obj.id}.jpg"
+            fpath = os.path.join(target_dir, fname)
+            cv2.imwrite(fpath, evidence, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            try:
+                os.chmod(fpath, 0o666)
+            except Exception:
+                pass
+            saved_paths["hierarchy_path"] = fpath
+
+            if crop is not None:
+                crop_fname = f"crop_{ts_int}_{direction_label}_track_{obj.id}.jpg"
+                crop_fpath = os.path.join(target_dir, crop_fname)
+                cv2.imwrite(crop_fpath, crop, [cv2.IMWRITE_JPEG_QUALITY, quality])
+                try:
+                    os.chmod(crop_fpath, 0o666)
+                except Exception:
+                    pass
+                saved_paths["crop_hierarchy_path"] = crop_fpath
+        except Exception as e:
+            logger.warning(f"Lỗi lưu ảnh mode hierarchy: {e}")
+
+    # 3. Gửi sự kiện đếm người kèm ảnh evidence lên CMS Backend (POST /api/alarms)
+    try:
+        from api_clients.api_clients import send_person_counting_event
+        frame_h, frame_w = frame.shape[:2]
+        x, y, w, h = obj.bbox
+        norm_bbox = [
+            max(0.0, min(1.0, round(float(x) / frame_w, 4))),
+            max(0.0, min(1.0, round(float(y) / frame_h, 4))),
+            max(0.0, min(1.0, round(float(x + w) / frame_w, 4))),
+            max(0.0, min(1.0, round(float(y + h) / frame_h, 4))),
+        ]
+        send_person_counting_event(
+            stream_id=str(cam_id),
+            direction=direction_label,
+            bbox=norm_bbox,
+            conf=float(obj.conf if obj.conf is not None else 0.8),
+            track_id=int(obj.id),
+            frame_id=frame_uuid,
+            frame=evidence,
+            cam_name=cam_name or str(cam_id),
+        )
+    except Exception as e:
+        logger.warning(f"[{cam_id}] Không thể gửi sự kiện đếm người lên CMS: {e}")
+
+    logger.info(f"[{cam_id}] Đã lưu ảnh người #{obj.id} [{direction_label}]: {saved_paths.get('hierarchy_path') or saved_paths.get('uuid_path')}")
+    return saved_paths
+
+
+def cleanup_old_images(base_dir: str = None, retention_days: int = None):
+    """Xóa các thư mục ảnh cũ hơn retention_days để tránh đầy đĩa."""
+    import shutil
+    from datetime import datetime, timedelta
+    days = retention_days if retention_days is not None else getattr(settings, 'IMAGE_RETENTION_DAYS', 30)
+    if days <= 0:
+        return
+    b_dir = base_dir or getattr(settings, 'SAVE_IMAGE_DIR', os.path.join(settings.ROOT_PATH, "images"))
+    if not os.path.exists(b_dir):
+        return
+
+    cutoff_date = datetime.now() - timedelta(days=days)
+    logger.info(f"Bắt đầu dọn dẹp ảnh cũ trước ngày: {cutoff_date.strftime('%Y-%m-%d')}")
+    try:
+        for root, dirs, _files in os.walk(b_dir, topdown=False):
+            for d in list(dirs):
+                try:
+                    dir_dt = datetime.strptime(d, "%Y-%m-%d")
+                    if dir_dt < cutoff_date:
+                        full_dir = os.path.join(root, d)
+                        logger.info(f"Xóa thư mục ảnh quá hạn: {full_dir}")
+                        shutil.rmtree(full_dir, ignore_errors=True)
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.error(f"Lỗi trong quá trình dọn dẹp ảnh cũ: {e}")
 
 def verify_plate_pattern(plate_text, pattern):
     """
