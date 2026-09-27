@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package yolo_person;
+
+// Request gửi ảnh đã resize và kích thước gốc
+message DetectRequest {
+  bytes image          = 1; // JPEG bytes
+  int32 resized_width  = 2;
+  int32 resized_height = 3;
+  int32 orig_width     = 4;
+  int32 orig_height    = 5;
+  repeated int32 allowed_classes = 6;
+}
+
+// Bounding box kèm độ tin cậy + class name
+message BoundingBox {
+  int32 x1           = 1;
+  int32 y1           = 2;
+  int32 x2           = 3;
+  int32 y2           = 4;
+  float confidence   = 5;
+  string class_name  = 6;
+}
+
+// Response trả list các bbox
+message DetectResponse {
+  repeated BoundingBox bboxes = 1;
+}
+
+service YoloService {
+  rpc DetectFrame (DetectRequest) returns (DetectResponse);
+}
