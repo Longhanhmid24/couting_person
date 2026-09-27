@@ -1,0 +1,21 @@
+# Environment secrets (TUYỆT ĐỐI KHÔNG COMMIT LÊN GIT HOẶC SHARE RA NGOÀI)
+.env
+*.env
+!.env.example
+
+# Models & Weights
+*.engine
+*.plan
+*.trt
+*.onnx
+*.pt
+*.pth
+*.weights
+
+# Python cache & logs
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+logs/
+images/

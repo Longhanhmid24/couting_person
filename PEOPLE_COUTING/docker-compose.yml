@@ -1,0 +1,68 @@
+# =============================================================================
+# COMPOSE TỔNG — Dịch vụ Đếm Người (PEOPLE_COUTING)
+# Chạy cả 2 microservices:
+#   1. grpc_person_detector (Port 50060, TensorRT / YOLOv8 Dynamic Batching)
+#   2. grpc-main-people-counting (Orchestrator: Camera readers, Tracking, Line crossing, CMS)
+#
+# Cách dùng:
+#   docker compose up -d --build
+# =============================================================================
+name: people-counting-system
+
+services:
+  detector:
+    build:
+      context: ./detector
+    image: ${IMAGE_NAME_DETECTOR:-harbor.tado.vn/long_dev/grpc-det-person:v2.0.0}
+    container_name: grpc_person_detector
+    volumes:
+      - ./detector/app/models/yolo/trt:/app/models/yolo/trt
+      - ./detector/app/models/yolo/pytorch:/app/models/yolo/pytorch
+    ports:
+      - "${DETECTOR_PORT_HOST:-50061}:50060"
+    environment:
+      GRPC_PORT: 50060
+      USE_TENSORRT: ${USE_TENSORRT:-false}
+      CONF_THRESHOLD: ${CONF_THRESHOLD:-0.35}
+      BATCH_SIZE: ${BATCH_SIZE:-8}
+      BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-10}
+    gpus: all
+    restart: always
+    networks:
+      - grpc-net
+
+  counting:
+    build:
+      context: ./counting
+    image: ${IMAGE_NAME_COUNTING:-harbor.tado.vn/long_dev/people_counting:v2.0.0}
+    container_name: grpc-main-people-counting
+    depends_on:
+      - detector
+    gpus: all
+    ipc: host
+    shm_size: '4gb'
+    environment:
+      BASE_URL_API: ${BASE_URL_API}
+      SESSION_KEY: ${SESSION_KEY}
+      SERVICE_TYPES: ${SERVICE_TYPES:-people_counting}
+      METRIC_TYPE: ${METRIC_TYPE:-people_counting}
+      YOLO_PERSON_ADDR: ${YOLO_PERSON_ADDR:-detector:50060}
+      GPU_ID: ${GPU_ID:-0}
+      FORCE_CPU_DECODE: ${FORCE_CPU_DECODE:-False}
+      USE_MOTION_DETECTOR: ${USE_MOTION_DETECTOR:-False}
+      SKIP_FRAME: ${SKIP_FRAME:-3}
+      CONFIDENT_PERSON: ${CONFIDENT_PERSON:-0.35}
+      STATISTICS_POST_INTERVAL: ${STATISTICS_POST_INTERVAL:-5}
+      STATS_LOG_INTERVAL: ${STATS_LOG_INTERVAL:-60}
+      TELEGRAM_BASE_URL: ${TELEGRAM_BASE_URL:-}
+      TELE_CHAT_ID: ${TELE_CHAT_ID:-}
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+    volumes:
+      - ${LOG_DIR:-/mnt/logs/people_counting}:/logs
+    restart: always
+    networks:
+      - grpc-net
+
+networks:
+  grpc-net:
+    driver: bridge

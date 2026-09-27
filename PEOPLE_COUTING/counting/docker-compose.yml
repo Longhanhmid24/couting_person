@@ -1,0 +1,34 @@
+# Chạy đơn lẻ orchestrator service: docker compose up -d --build
+services:
+  people-counting:
+    build: .
+    image: ${IMAGE_NAME_COUNTING:-harbor.tado.vn/long_dev/people_counting:v2.0.0}
+    container_name: grpc-main-people-counting
+    gpus: all
+    ipc: host
+    shm_size: '4gb'
+    environment:
+      BASE_URL_API: ${BASE_URL_API}
+      SESSION_KEY: ${SESSION_KEY}
+      SERVICE_TYPES: ${SERVICE_TYPES:-people_counting}
+      METRIC_TYPE: ${METRIC_TYPE:-people_counting}
+      YOLO_PERSON_ADDR: ${YOLO_PERSON_ADDR:-grpc_person_detector:50060}
+      GPU_ID: ${GPU_ID:-0}
+      FORCE_CPU_DECODE: ${FORCE_CPU_DECODE:-False}
+      USE_MOTION_DETECTOR: ${USE_MOTION_DETECTOR:-False}
+      SKIP_FRAME: ${SKIP_FRAME:-3}
+      CONFIDENT_PERSON: ${CONFIDENT_PERSON:-0.35}
+      STATISTICS_POST_INTERVAL: ${STATISTICS_POST_INTERVAL:-5}
+      STATS_LOG_INTERVAL: ${STATS_LOG_INTERVAL:-60}
+      TELEGRAM_BASE_URL: ${TELEGRAM_BASE_URL:-}
+      TELE_CHAT_ID: ${TELE_CHAT_ID:-}
+      NVIDIA_DRIVER_CAPABILITIES: "all"
+    volumes:
+      - ${LOG_DIR:-/mnt/logs/people_counting}:/logs
+    restart: always
+    networks:
+      - grpc-net
+
+networks:
+  grpc-net:
+    driver: bridge

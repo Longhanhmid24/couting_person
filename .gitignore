@@ -1,0 +1,31 @@
+# Environment secrets (DO NOT COMMIT REAL SECRETS)
+.env
+deploy/.env
+deploy/.env.dev
+*.env
+!.env.example
+!deploy/.env.example
+
+# Microservice directories (managed in their own individual repositories)
+alarm/
+trafsec/
+facerec/
+
+# Model binaries & TensorRT engines
+*.engine
+*.plan
+*.trt
+*.onnx
+*.pt
+*.pth
+*.weights
+deploy/models/
+models/
+
+# Python cache & logs
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+logs/
+.DS_Store
