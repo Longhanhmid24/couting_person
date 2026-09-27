@@ -8,7 +8,6 @@
 *.plan
 *.trt
 *.onnx
-*.pt
 *.pth
 *.weights
 

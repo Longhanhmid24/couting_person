@@ -16,11 +16,10 @@ facerec/
 *.plan
 *.trt
 *.onnx
-*.pt
 *.pth
 *.weights
 deploy/models/
-models/
+
 
 # Python cache & logs
 __pycache__/
