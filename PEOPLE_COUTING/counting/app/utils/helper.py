@@ -187,11 +187,22 @@ def save_frame_with_name(name_frame: str, image, quality=95):
 def draw_person_counting_evidence(frame: np.ndarray, obj, line_points=None,
                                   direction_vector=None, direction_label: str = "IN",
                                   max_w: int = 1280, max_h: int = 720) -> np.ndarray:
-    """Vẽ ảnh bằng chứng khoảnh khắc người vượt qua vạch đếm."""
+    """Vẽ ảnh bằng chứng khoảnh khắc người vượt qua vạch đếm.
+    Nếu ENABLE_DRAW_OVERLAY=False (mặc định), giữ nguyên ảnh gốc sạch (Clean Frame),
+    chỉ resize nếu kích thước vượt ngưỡng để tiết kiệm tối đa CPU cho AI Core."""
     if frame is None:
         return None
+    h_orig, w_orig = frame.shape[:2]
+
+    # Kiểm tra cờ cấu hình: Tắt vẽ overlay nếu được yêu cầu để UI tự render
+    if not getattr(settings, 'ENABLE_DRAW_OVERLAY', False):
+        if max_w > 0 and max_h > 0 and (w_orig > max_w or h_orig > max_h):
+            scale = min(max_w / w_orig, max_h / h_orig)
+            nw, nh = int(round(w_orig * scale)), int(round(h_orig * scale))
+            return cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        return frame.copy()
+
     evidence = frame.copy()
-    h_orig, w_orig = evidence.shape[:2]
 
     # 1. Vẽ vạch đếm (Counting Line) màu vàng nét đậm
     if line_points and len(line_points) >= 2:
@@ -375,7 +386,7 @@ def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
         except Exception as e:
             logger.warning(f"Lỗi lưu ảnh mode hierarchy: {e}")
 
-    # 3. Gửi sự kiện đếm người kèm ảnh evidence lên CMS Backend (POST /api/alarms)
+    # 3. Gửi sự kiện đếm người kèm ảnh sạch và tọa độ chuẩn hóa lên CMS Backend (POST /api/alarms)
     try:
         from api_clients.api_clients import send_person_counting_event
         frame_h, frame_w = frame.shape[:2]
@@ -386,6 +397,33 @@ def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
             max(0.0, min(1.0, round(float(x + w) / frame_w, 4))),
             max(0.0, min(1.0, round(float(y + h) / frame_h, 4))),
         ]
+
+        norm_line = []
+        if line_points and len(line_points) >= 2:
+            for pt in line_points[:2]:
+                if pt is not None and len(pt) >= 2:
+                    norm_line.append([
+                        max(0.0, min(1.0, round(float(pt[0]) / frame_w, 4))),
+                        max(0.0, min(1.0, round(float(pt[1]) / frame_h, 4))),
+                    ])
+
+        norm_direction = None
+        if direction_vector is not None and len(direction_vector) >= 2:
+            norm_direction = [
+                round(float(direction_vector[0]), 4),
+                round(float(direction_vector[1]), 4),
+            ]
+
+        norm_trajectory = []
+        raw_pts = getattr(obj, 'path_bottom', None) or getattr(obj, 'path_center', [])
+        if raw_pts:
+            for pt in raw_pts:
+                if pt is not None and len(pt) >= 2:
+                    norm_trajectory.append([
+                        max(0.0, min(1.0, round(float(pt[0]) / frame_w, 4))),
+                        max(0.0, min(1.0, round(float(pt[1]) / frame_h, 4))),
+                    ])
+
         send_person_counting_event(
             stream_id=str(cam_id),
             direction=direction_label,
@@ -395,6 +433,11 @@ def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
             frame_id=frame_uuid,
             frame=evidence,
             cam_name=cam_name or str(cam_id),
+            counting_line=norm_line if norm_line else None,
+            direction_vector=norm_direction,
+            trajectory=norm_trajectory if norm_trajectory else None,
+            image_width=frame_w,
+            image_height=frame_h,
         )
     except Exception as e:
         logger.warning(f"[{cam_id}] Không thể gửi sự kiện đếm người lên CMS: {e}")

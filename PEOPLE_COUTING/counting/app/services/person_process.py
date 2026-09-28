@@ -241,6 +241,17 @@ class CountingTrackedPerson:
                    path_net_displacement(self.path_center))
 
 
+class CountedPersonSnapshot:
+    """Bản chụp bất biến dữ liệu đối tượng vượt vạch để xử lý và lưu trữ thread-safe trong image_writer_pool."""
+    def __init__(self, obj):
+        self.id = int(obj.id)
+        self.bbox = tuple(int(v) for v in obj.bbox)
+        self.conf = float(obj.conf) if getattr(obj, 'conf', None) is not None else 0.8
+        self.cls = getattr(obj, 'cls', None)
+        self.path_bottom = [tuple(float(c) for c in p) for p in getattr(obj, 'path_bottom', []) if p is not None]
+        self.path_center = [tuple(float(c) for c in p) for p in getattr(obj, 'path_center', []) if p is not None]
+
+
 class PersonProcessor:
     """Detect người + tracking + đếm vượt vạch. Một instance mỗi camera."""
 
@@ -584,10 +595,11 @@ class PersonProcessor:
                 frame_snap = frame.copy()
                 line_pts = list(self._line_points) if self._line_points else None
                 dir_vec = tuple(self._direction_vector) if self._direction_vector else None
+                obj_snap = CountedPersonSnapshot(obj)
                 self.image_writer_pool.submit(
                     save_counted_person_images,
                     frame=frame_snap,
-                    obj=obj,
+                    obj=obj_snap,
                     line_points=line_pts,
                     direction_vector=dir_vec,
                     direction_label=direction_label,

@@ -152,11 +152,15 @@ def send_person_counting_event(
     frame=None,
     image_base64: str = None,
     cam_name: str = None,
+    counting_line: list = None,
+    direction_vector: list = None,
+    trajectory: list = None,
+    image_width: int = None,
+    image_height: int = None,
 ):
     """
-    Bắn sự kiện đếm người (kèm ảnh evidence) lên CMS qua POST /api/alarms.
-    C# desktop client (Kabe VMS) sẽ nhận realtime và hiển thị trong danh sách thẻ ảnh
-    (Tìm kiếm AI -> Đếm người).
+    Bắn sự kiện đếm người (kèm ảnh sạch và tọa độ chuẩn hóa) lên CMS qua POST /api/alarms.
+    C# desktop client (Kabe VMS) và Web CMS sẽ nhận realtime, tự động render BBox và overlay.
     """
     action = "enter" if str(direction).lower() in ("in", "enter") else "exit"
     dir_str = "in" if action == "enter" else "out"
@@ -171,6 +175,23 @@ def send_person_counting_event(
         "track_id": int(track_id),
         "camera_name": cam_name or stream_id,
     }
+    if image_width:
+        attrs["image_width"] = int(image_width)
+    if image_height:
+        attrs["image_height"] = int(image_height)
+
+    # Đóng gói đối tượng tọa độ đa lớp chuẩn hóa (Standard Coordinate Contract)
+    coords = {
+        "bbox": bbox,
+    }
+    if counting_line:
+        coords["counting_line"] = counting_line
+    if direction_vector:
+        coords["direction_vector"] = direction_vector
+    if trajectory:
+        coords["trajectory"] = trajectory
+    attrs["coordinates"] = coords
+
     return create_alarm(
         stream_id=stream_id,
         type="people_counting",

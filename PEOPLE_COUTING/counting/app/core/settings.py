@@ -54,6 +54,7 @@ class Settings:
     )
     SAVE_IMAGE_DIR = os.getenv("SAVE_IMAGE_DIR", os.path.join(ROOT_PATH, "images"))
     ENABLE_SAVE_IMAGE = _flag("ENABLE_SAVE_IMAGE", "True")
+    ENABLE_DRAW_OVERLAY = _flag("ENABLE_DRAW_OVERLAY", "False")
     IMAGE_STORAGE_MODE = os.getenv("IMAGE_STORAGE_MODE", "both").lower()  # "uuid", "hierarchy", "both"
     SAVE_PERSON_CROP = _flag("SAVE_PERSON_CROP", "True")
     JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", 75))
