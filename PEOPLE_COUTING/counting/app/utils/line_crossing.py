@@ -228,13 +228,14 @@ class LineZoneCrossingFSM:
         self.saw_transit = False
         self.transit_origin = None
         self.last_point = None
+        self.out_of_bounds_frames = 0
 
     def _signed_distance(self, point):
         (x1,y1),(x2,y2)=self.line
         dx,dy=x2-x1,y2-y1
         length=max((dx*dx+dy*dy)**.5,1e-9)
         projection=((point[0]-x1)*dx+(point[1]-y1)*dy)/(length*length)
-        if projection < -.1 or projection > 1.1:
+        if projection < 0.02 or projection > 0.98:
             return None
         return (dx*(point[1]-y1)-dy*(point[0]-x1))/length
 
@@ -247,7 +248,13 @@ class LineZoneCrossingFSM:
         point=(float(point[0]),float(point[1])); signed=self._signed_distance(point)
         if signed is None:
             self.last_point=point
+            self.out_of_bounds_frames += 1
+            if self.out_of_bounds_frames >= 3:
+                self.state = None
+                self.saw_transit = False
+                self.transit_origin = None
             return None, False
+        self.out_of_bounds_frames = 0
         side=self._side(signed)
         self.history.append(point)
         stationary=len(self.history)>=self.history.maxlen and max(

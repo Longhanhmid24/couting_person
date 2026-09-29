@@ -55,6 +55,7 @@ class Settings:
     SAVE_IMAGE_DIR = os.getenv("SAVE_IMAGE_DIR", os.path.join(ROOT_PATH, "images"))
     ENABLE_SAVE_IMAGE = _flag("ENABLE_SAVE_IMAGE", "True")
     ENABLE_DRAW_OVERLAY = _flag("ENABLE_DRAW_OVERLAY", "False")
+    ENABLE_LIVE_STREAM = _flag("ENABLE_LIVE_STREAM", "True")
     IMAGE_STORAGE_MODE = os.getenv("IMAGE_STORAGE_MODE", "both").lower()  # "uuid", "hierarchy", "both"
     SAVE_PERSON_CROP = _flag("SAVE_PERSON_CROP", "True")
     JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", 75))
@@ -74,7 +75,7 @@ class Settings:
     FRAME_BACKLOG_MAX = int(os.getenv("FRAME_BACKLOG_MAX", 4))
 
     # ── Ngưỡng confidence ─────────────────────────────────────────────
-    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.40))
+    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.25))
 
     # ── Tracking ──────────────────────────────────────────────────────
     MATCH_IOU_THRESHOLD = float(os.getenv("MATCH_IOU_THRESHOLD", 0.15))
@@ -85,9 +86,9 @@ class Settings:
 
     # ByteTrack / people-counting hysteresis
     USE_BYTETRACK = _flag("USE_BYTETRACK", "True")
-    TRACK_HIGH_THRESH = float(os.getenv("TRACK_HIGH_THRESH", 0.40))
+    TRACK_HIGH_THRESH = float(os.getenv("TRACK_HIGH_THRESH", 0.25))
     TRACK_LOW_THRESH = float(os.getenv("TRACK_LOW_THRESH", 0.10))
-    NEW_TRACK_THRESH = float(os.getenv("NEW_TRACK_THRESH", 0.50))
+    NEW_TRACK_THRESH = float(os.getenv("NEW_TRACK_THRESH", 0.35))
     TRACK_BUFFER = int(os.getenv("TRACK_BUFFER", 25))
     COUNTED_RETIRE_FRAMES = int(os.getenv("COUNTED_RETIRE_FRAMES", 5))
     BOUNDARY_MARGIN = int(os.getenv("BOUNDARY_MARGIN", 20))

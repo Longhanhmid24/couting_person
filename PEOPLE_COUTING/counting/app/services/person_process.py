@@ -248,6 +248,12 @@ class PersonProcessor:
             else:
                 tracked_objects = self._track_round(tracked_objects, frame, frame_uuid=frame_uuid)
 
+            if getattr(settings, 'ENABLE_LIVE_STREAM', False):
+                try:
+                    from utils.live_streamer import update_stream_frame
+                    update_stream_frame(frame, tracked_objects, self._line_points, self._direction_vector, self.cam_name)
+                except Exception:
+                    pass
 
             self._log_stats_if_due(len(tracked_objects))
 
@@ -274,7 +280,33 @@ class PersonProcessor:
             if box[2] > 1 and box[3] > 1 and conf >= settings.TRACK_LOW_THRESH:
                 detections.append((box, conf, cls))
         self._stats["detections"] += len(detections)
-        return detections
+        return self._filter_nested_boxes(detections)
+
+    @staticmethod
+    def _filter_nested_boxes(detections, iom_threshold=0.60):
+        """Loại bỏ box con bị lồng bên trong box lớn (ví dụ YOLO vừa detect cả người vừa detect nửa thân trên)."""
+        if len(detections) <= 1:
+            return detections
+        # Ưu tiên box có chiều cao/diện tích lớn hơn (full người) và confidence
+        sorted_dets = sorted(detections, key=lambda d: (d[0][3] * d[0][2], d[1]), reverse=True)
+        kept = []
+        for box, conf, cls in sorted_dets:
+            bx, by, bw, bh = box
+            ba = bw * bh
+            duplicate = False
+            for k_box, k_conf, k_cls in kept:
+                kx, ky, kw, kh = k_box
+                ka = kw * kh
+                ix1, iy1 = max(bx, kx), max(by, ky)
+                ix2, iy2 = min(bx + bw, kx + kw), min(by + bh, ky + kh)
+                inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                min_area = min(ba, ka)
+                if min_area > 0 and (inter / min_area) > iom_threshold:
+                    duplicate = True
+                    break
+            if not duplicate:
+                kept.append((box, conf, cls))
+        return kept
 
     def _process_tracker_results(self, results, expired, frame, frame_count, frame_uuid=None):
         h, w = frame.shape[:2] if frame is not None else (720, 1280)
@@ -337,6 +369,37 @@ class PersonProcessor:
                 obj = self._person_tracks[t.track_id]
                 if obj.lost <= 1:
                     active_objects.append(obj)
+
+        # Khử trùng lặp giữa các track đang active (nếu 2 track lồng nhau trên cùng 1 người)
+        if len(active_objects) > 1:
+            sorted_active = sorted(active_objects, key=lambda o: (getattr(o, "counted", False), o.bbox[3], o.conf or 0), reverse=True)
+            kept_active = []
+            dup_ids = set()
+            for obj in sorted_active:
+                if obj.id in dup_ids:
+                    continue
+                bx, by, bw, bh = obj.bbox
+                ba = bw * bh
+                kept_active.append(obj)
+                for other in sorted_active:
+                    if other.id == obj.id or other.id in dup_ids:
+                        continue
+                    ox, oy, ow, oh = other.bbox
+                    oa = ow * oh
+                    ix1, iy1 = max(bx, ox), max(by, oy)
+                    ix2, iy2 = min(bx + bw, ox + ow), min(by + bh, oy + oh)
+                    inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+                    min_a = min(ba, oa)
+                    if min_a > 0 and (inter / min_a) > 0.60:
+                        dup_ids.add(other.id)
+
+            if dup_ids:
+                for did in dup_ids:
+                    self._person_tracks.pop(did, None)
+                if hasattr(self.byte_tracker, "retire"):
+                    self.byte_tracker.retire(dup_ids)
+                active_objects = kept_active
+
         return active_objects
 
     def _detect_round(self, tracked_objects, frame, frame_count, frame_uuid=None):
@@ -416,7 +479,7 @@ class PersonProcessor:
             self._stats["gate_movement"] += 1
         if obj.counted or not event:
             return
-        min_conf = float(getattr(settings, "CONFIDENT_PERSON", 0.40))
+        min_conf = float(getattr(settings, "CONFIDENT_PERSON", 0.25))
         if obj.conf is not None and float(obj.conf) < min_conf:
             return
         if obj.frame_count < settings.MIN_FRAMES_BEFORE_COUNT:
