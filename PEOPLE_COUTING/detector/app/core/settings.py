@@ -14,7 +14,7 @@ class Settings:
 
     # Inference
     USE_TENSORRT = os.getenv("USE_TENSORRT", "false").lower() in ("true", "1", "yes")
-    CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.35))
+    CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", 0.10))
     EXPORT_DYNAMIC_BATCH = os.getenv("EXPORT_DYNAMIC_BATCH", "true").lower() in ("true", "1", "yes")
 
     # Classes

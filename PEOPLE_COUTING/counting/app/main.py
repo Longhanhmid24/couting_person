@@ -6,6 +6,7 @@ Invokes CentralEngine to manage all streams, GPU decoding, and central counting 
 import os
 import sys
 import engine
+from core.settings import settings
 
 if __name__ == "__main__":
     engine.main()

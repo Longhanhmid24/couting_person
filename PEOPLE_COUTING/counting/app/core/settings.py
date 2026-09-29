@@ -74,14 +74,29 @@ class Settings:
     FRAME_BACKLOG_MAX = int(os.getenv("FRAME_BACKLOG_MAX", 4))
 
     # ── Ngưỡng confidence ─────────────────────────────────────────────
-    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.35))
+    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.40))
 
     # ── Tracking ──────────────────────────────────────────────────────
     MATCH_IOU_THRESHOLD = float(os.getenv("MATCH_IOU_THRESHOLD", 0.15))
     MATCH_MAX_AREA_RATIO = float(os.getenv("MATCH_MAX_AREA_RATIO", 4.0))
     MATCH_BY_DISTANCE = _flag("MATCH_BY_DISTANCE", "True")
     MATCH_DISTANCE_FACTOR = float(os.getenv("MATCH_DISTANCE_FACTOR", 1.8))
-    MAX_LOST_ROUNDS = int(os.getenv("MAX_LOST_ROUNDS", 15))
+    MAX_LOST_ROUNDS = int(os.getenv("MAX_LOST_ROUNDS", 30))
+
+    # ByteTrack / people-counting hysteresis
+    USE_BYTETRACK = _flag("USE_BYTETRACK", "True")
+    TRACK_HIGH_THRESH = float(os.getenv("TRACK_HIGH_THRESH", 0.40))
+    TRACK_LOW_THRESH = float(os.getenv("TRACK_LOW_THRESH", 0.10))
+    NEW_TRACK_THRESH = float(os.getenv("NEW_TRACK_THRESH", 0.50))
+    TRACK_BUFFER = int(os.getenv("TRACK_BUFFER", 25))
+    COUNTED_RETIRE_FRAMES = int(os.getenv("COUNTED_RETIRE_FRAMES", 5))
+    BOUNDARY_MARGIN = int(os.getenv("BOUNDARY_MARGIN", 20))
+    MATCH_THRESH = float(os.getenv("MATCH_THRESH", 0.80))
+    LINE_BUFFER_PIXELS = float(os.getenv("LINE_BUFFER_PIXELS", 35.0))
+    STATIONARY_DISPLACEMENT_MAX = float(os.getenv("STATIONARY_DISPLACEMENT_MAX", 20.0))
+    STATIONARY_FRAMES = int(os.getenv("STATIONARY_FRAMES", 15))
+    COUNT_COOLDOWN_SECONDS = float(os.getenv("COUNT_COOLDOWN_SECONDS", 3.0))
+    ENABLE_TRACK_STITCHER = _flag("ENABLE_TRACK_STITCHER", "True")
 
     # ── HOG nội suy giữa hai vòng YOLO ────────────────────────────────
     HOG_HEAVY_EVERY = int(os.getenv("HOG_HEAVY_EVERY", 2))
@@ -90,9 +105,9 @@ class Settings:
     HOG_GAIN_MARGIN = float(os.getenv("HOG_GAIN_MARGIN", 0.05))
 
     # ── Điều kiện đếm ─────────────────────────────────────────────────
-    MIN_FRAMES_BEFORE_COUNT = int(os.getenv("MIN_FRAMES_BEFORE_COUNT", 2))
-    MIN_PATH_MOVEMENT_PIXELS = float(os.getenv("MIN_PATH_MOVEMENT_PIXELS", 5.0))
-    PATH_HISTORY_LEN = int(os.getenv("PATH_HISTORY_LEN", 12))
+    MIN_FRAMES_BEFORE_COUNT = int(os.getenv("MIN_FRAMES_BEFORE_COUNT", 6))
+    MIN_PATH_MOVEMENT_PIXELS = float(os.getenv("MIN_PATH_MOVEMENT_PIXELS", 30.0))
+    PATH_HISTORY_LEN = int(os.getenv("PATH_HISTORY_LEN", 16))
 
     # ── Statistics ────────────────────────────────────────────────────
     STATISTICS_POST_INTERVAL = int(os.getenv("STATISTICS_POST_INTERVAL", 5))

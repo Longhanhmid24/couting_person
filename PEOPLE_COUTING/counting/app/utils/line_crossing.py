@@ -212,3 +212,93 @@ def check_vehicle_line_crossing(prev_center, curr_center, prev_bottom, curr_bott
             return True
 
     return False
+
+
+class LineZoneCrossingFSM:
+    """Per-track hysteresis state machine around a finite counting line."""
+    def __init__(self, line_points, buffer_pixels=35.0, direction_vector=None,
+                 stationary_displacement=20.0, stationary_frames=15):
+        from collections import deque
+        self.line = line_points
+        self.buffer = max(1.0, float(buffer_pixels))
+        self.direction = tuple(direction_vector) if direction_vector else None
+        self.history = deque(maxlen=max(2, int(stationary_frames)))
+        self.stationary_displacement = float(stationary_displacement)
+        self.state = None
+        self.saw_transit = False
+        self.transit_origin = None
+        self.last_point = None
+
+    def _signed_distance(self, point):
+        (x1,y1),(x2,y2)=self.line
+        dx,dy=x2-x1,y2-y1
+        length=max((dx*dx+dy*dy)**.5,1e-9)
+        projection=((point[0]-x1)*dx+(point[1]-y1)*dy)/(length*length)
+        if projection < -.1 or projection > 1.1:
+            return None
+        return (dx*(point[1]-y1)-dy*(point[0]-x1))/length
+
+    def _side(self, signed):
+        if abs(signed) <= self.buffer/2: return 0
+        return 1 if signed > 0 else -1
+
+    def update(self, point, bbox=None, now=None):
+        if not self.line or point is None: return None, False
+        point=(float(point[0]),float(point[1])); signed=self._signed_distance(point)
+        if signed is None:
+            self.last_point=point
+            return None, False
+        side=self._side(signed)
+        self.history.append(point)
+        stationary=len(self.history)>=self.history.maxlen and max(
+            (((a[0]-b[0])**2+(a[1]-b[1])**2)**.5)
+            for a in self.history for b in self.history
+        ) < self.stationary_displacement
+        previous=self.state
+        event=None
+        if previous is None:
+            self.state=side
+            if side==0:
+                self.saw_transit=True
+        elif side==0:
+            if previous != 0:
+                self.transit_origin=previous
+            self.state=0; self.saw_transit=True
+        elif previous==0:
+            if self.saw_transit and self.transit_origin is not None and side != self.transit_origin:
+                if self.direction and self.last_point is not None:
+                    dx=point[0]-self.last_point[0]; dy=point[1]-self.last_point[1]
+                    event="person_in" if dx*self.direction[0]+dy*self.direction[1] > 0 else "person_out"
+                else:
+                    event="person_in" if side>0 else "person_out"
+            self.state=side; self.saw_transit=False; self.transit_origin=None
+        elif side != previous:
+            # A fast step can cross the whole deadzone between detections.
+            self.state=side
+            if self.direction and self.last_point is not None:
+                dx=point[0]-self.last_point[0]; dy=point[1]-self.last_point[1]
+                event="person_in" if dx*self.direction[0]+dy*self.direction[1] > 0 else "person_out"
+            else:
+                event="person_in" if side>0 else "person_out"
+            self.saw_transit=False; self.transit_origin=None
+        self.last_point=point
+        return (None if stationary else event), stationary
+
+
+class SpatialCooldownRegistry:
+    """Suppress nearby repeated counts during a short time window."""
+    def __init__(self, cooldown_seconds=3.0):
+        from collections import deque
+        self.cooldown=float(cooldown_seconds); self.events=deque()
+
+    def allow(self, point, bbox, direction, now=None):
+        import time
+        now=time.monotonic() if now is None else now
+        while self.events and now-self.events[0][2] > self.cooldown:
+            self.events.popleft()
+        radius=1.2*max(float(bbox[2]),float(bbox[3]),1.0)
+        for x,y,ts,old_direction,old_radius in self.events:
+            if now-ts<=self.cooldown and (point[0]-x)**2+(point[1]-y)**2 < max(radius,old_radius)**2:
+                return False
+        self.events.append((float(point[0]),float(point[1]),now,direction,radius))
+        return True

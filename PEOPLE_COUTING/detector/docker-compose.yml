@@ -12,7 +12,7 @@ services:
     environment:
       GRPC_PORT: 50060
       USE_TENSORRT: ${USE_TENSORRT:-false}
-      CONF_THRESHOLD: ${CONF_THRESHOLD:-0.35}
+      CONF_THRESHOLD: ${CONF_THRESHOLD:-0.10}
       BATCH_SIZE: ${BATCH_SIZE:-8}
       BATCH_TIMEOUT_MS: ${BATCH_TIMEOUT_MS:-10}
     gpus: all
