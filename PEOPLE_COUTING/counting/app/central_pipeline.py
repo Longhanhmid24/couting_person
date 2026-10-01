@@ -44,7 +44,7 @@ def parse_camera_params(cam: dict, rules: list = None):
 
     if not line_config:
         LOGGER.warning(
-            f"[{cam_name}] ⚠️ Chưa cấu hình counting line — reader vẫn chạy để kết nối và phát live stream, "
+            f"[{cam_name}] ⚠️ Chưa cấu hình counting line — reader vẫn chạy để kết nối, "
             f"sẽ tự động đếm người khi vạch được kẻ trên CMS UI."
         )
     elif not direction_config:

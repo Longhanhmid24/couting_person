@@ -75,7 +75,7 @@ class Settings:
     FRAME_BACKLOG_MAX = int(os.getenv("FRAME_BACKLOG_MAX", 4))
 
     # ── Ngưỡng confidence ─────────────────────────────────────────────
-    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.25))
+    CONFIDENT_PERSON = float(os.getenv("CONFIDENT_PERSON", 0.40))
 
     # ── Tracking ──────────────────────────────────────────────────────
     MATCH_IOU_THRESHOLD = float(os.getenv("MATCH_IOU_THRESHOLD", 0.15))
@@ -86,17 +86,19 @@ class Settings:
 
     # ByteTrack / people-counting hysteresis
     USE_BYTETRACK = _flag("USE_BYTETRACK", "True")
-    TRACK_HIGH_THRESH = float(os.getenv("TRACK_HIGH_THRESH", 0.25))
+    TRACK_HIGH_THRESH = float(os.getenv("TRACK_HIGH_THRESH", 0.35))
     TRACK_LOW_THRESH = float(os.getenv("TRACK_LOW_THRESH", 0.10))
-    NEW_TRACK_THRESH = float(os.getenv("NEW_TRACK_THRESH", 0.35))
+    NEW_TRACK_THRESH = float(os.getenv("NEW_TRACK_THRESH", 0.40))
     TRACK_BUFFER = int(os.getenv("TRACK_BUFFER", 25))
     COUNTED_RETIRE_FRAMES = int(os.getenv("COUNTED_RETIRE_FRAMES", 5))
     BOUNDARY_MARGIN = int(os.getenv("BOUNDARY_MARGIN", 20))
     MATCH_THRESH = float(os.getenv("MATCH_THRESH", 0.80))
     LINE_BUFFER_PIXELS = float(os.getenv("LINE_BUFFER_PIXELS", 35.0))
-    STATIONARY_DISPLACEMENT_MAX = float(os.getenv("STATIONARY_DISPLACEMENT_MAX", 20.0))
+    STATIONARY_DISPLACEMENT_MAX = float(os.getenv("STATIONARY_DISPLACEMENT_MAX", 35.0))
     STATIONARY_FRAMES = int(os.getenv("STATIONARY_FRAMES", 15))
-    COUNT_COOLDOWN_SECONDS = float(os.getenv("COUNT_COOLDOWN_SECONDS", 3.0))
+    COUNT_COOLDOWN_SECONDS = float(os.getenv("COUNT_COOLDOWN_SECONDS", 1.8))
+    COOLDOWN_PARALLEL_MIN_DIST = float(os.getenv("COOLDOWN_PARALLEL_MIN_DIST", 60.0))
+    COOLDOWN_MIN_INDEPENDENT_FRAMES = int(os.getenv("COOLDOWN_MIN_INDEPENDENT_FRAMES", 12))
     ENABLE_TRACK_STITCHER = _flag("ENABLE_TRACK_STITCHER", "True")
 
     # ── HOG nội suy giữa hai vòng YOLO ────────────────────────────────
@@ -105,9 +107,13 @@ class Settings:
     HOG_MIN_SIMILARITY = float(os.getenv("HOG_MIN_SIMILARITY", 0.20))
     HOG_GAIN_MARGIN = float(os.getenv("HOG_GAIN_MARGIN", 0.05))
 
-    # ── Điều kiện đếm ─────────────────────────────────────────────────
-    MIN_FRAMES_BEFORE_COUNT = int(os.getenv("MIN_FRAMES_BEFORE_COUNT", 6))
-    MIN_PATH_MOVEMENT_PIXELS = float(os.getenv("MIN_PATH_MOVEMENT_PIXELS", 30.0))
+    # ── Điều kiện đếm & Cổng lọc Edge Cases ────────────────────────────
+    MIN_FRAMES_BEFORE_COUNT = int(os.getenv("MIN_FRAMES_BEFORE_COUNT", 5))
+    MIN_PATH_MOVEMENT_PIXELS = float(os.getenv("MIN_PATH_MOVEMENT_PIXELS", 35.0))
+    MIN_ENTRY_DISTANCE_LINE = float(os.getenv("MIN_ENTRY_DISTANCE_LINE", 25.0))
+    MIN_PERSON_HEIGHT = int(os.getenv("MIN_PERSON_HEIGHT", 110))
+    MAX_PERSON_ASPECT_RATIO = float(os.getenv("MAX_PERSON_ASPECT_RATIO", 0.85))
+    MAX_PERSON_AREA = float(os.getenv("MAX_PERSON_AREA", 32000.0))
     PATH_HISTORY_LEN = int(os.getenv("PATH_HISTORY_LEN", 16))
 
     # ── Statistics ────────────────────────────────────────────────────

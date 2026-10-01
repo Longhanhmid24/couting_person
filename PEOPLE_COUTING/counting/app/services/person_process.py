@@ -6,6 +6,7 @@ person_process.py — Detect người + tracking + đếm vượt vạch. Một 
 """
 import concurrent.futures
 import logging
+import math
 import queue
 import time
 from collections import deque
@@ -17,6 +18,7 @@ from utils.line_crossing import (
     get_bbox_center,
     get_bbox_bottom_center,
     parse_line_points,
+    point_to_line_segment_distance,
     LineZoneCrossingFSM, SpatialCooldownRegistry,
 )
 from utils.helper import save_counted_person_images, cleanup_old_images
@@ -47,8 +49,16 @@ class CountingTrackedPerson:
         history = max(3, int(settings.PATH_HISTORY_LEN))
         self.path_center = deque(maxlen=history)
         self.path_bottom = deque(maxlen=history)
-        self.path_center.append(get_bbox_center(self.bbox))
-        self.path_bottom.append(get_bbox_bottom_center(self.bbox))
+        c = get_bbox_center(self.bbox)
+        b = get_bbox_bottom_center(self.bbox)
+        self.path_center.append(c)
+        self.path_bottom.append(b)
+
+        # Lưu vị trí ban đầu bất biến khi track mới sinh ra
+        self.first_bottom = b
+        self.first_center = c
+        self.first_bbox = self.bbox
+        self.first_time = self.created_time
 
 
     @property
@@ -133,7 +143,11 @@ class PersonProcessor:
             track_buffer=settings.TRACK_BUFFER)
         self.track_stitcher = TrackStitcher() if settings.ENABLE_TRACK_STITCHER else None
         self._person_tracks = {}
-        self._cooldown = SpatialCooldownRegistry(settings.COUNT_COOLDOWN_SECONDS)
+        self._cooldown = SpatialCooldownRegistry(
+            settings.COUNT_COOLDOWN_SECONDS,
+            min_parallel_dist=getattr(settings, "COOLDOWN_PARALLEL_MIN_DIST", 60.0),
+            min_independent_frames=getattr(settings, "COOLDOWN_MIN_INDEPENDENT_FRAMES", 12),
+        )
         self.total_counted = 0
         self._stats = {
             "frames": 0, "frames_dropped": 0, "detect_rounds": 0, "detections": 0,
@@ -248,13 +262,6 @@ class PersonProcessor:
             else:
                 tracked_objects = self._track_round(tracked_objects, frame, frame_uuid=frame_uuid)
 
-            if getattr(settings, 'ENABLE_LIVE_STREAM', False):
-                try:
-                    from utils.live_streamer import update_stream_frame
-                    update_stream_frame(frame, tracked_objects, self._line_points, self._direction_vector, self.cam_name)
-                except Exception:
-                    pass
-
             self._log_stats_if_due(len(tracked_objects))
 
         logger.info(f"[{self.cam_name}] PersonProcessor dừng — "
@@ -283,7 +290,7 @@ class PersonProcessor:
         return self._filter_nested_boxes(detections)
 
     @staticmethod
-    def _filter_nested_boxes(detections, iom_threshold=0.60):
+    def _filter_nested_boxes(detections, iom_threshold=0.45):
         """Loại bỏ box con bị lồng bên trong box lớn (ví dụ YOLO vừa detect cả người vừa detect nửa thân trên)."""
         if len(detections) <= 1:
             return detections
@@ -293,6 +300,8 @@ class PersonProcessor:
         for box, conf, cls in sorted_dets:
             bx, by, bw, bh = box
             ba = bw * bh
+            bcx = bx + bw / 2.0
+            bcy = by + bh / 2.0
             duplicate = False
             for k_box, k_conf, k_cls in kept:
                 kx, ky, kw, kh = k_box
@@ -301,9 +310,16 @@ class PersonProcessor:
                 ix2, iy2 = min(bx + bw, kx + kw), min(by + bh, ky + kh)
                 inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
                 min_area = min(ba, ka)
-                if min_area > 0 and (inter / min_area) > iom_threshold:
-                    duplicate = True
-                    break
+                if min_area > 0:
+                    # 1. Trùng lặp IoM
+                    if (inter / min_area) > iom_threshold:
+                        duplicate = True
+                        break
+                    # 2. Box con (ví dụ nửa thân trên/tay lái) nằm phần lớn trong box lớn
+                    if ba < ka and (inter / ba) > 0.40:
+                        if kx <= bcx <= (kx + kw) and ky <= bcy <= (ky + kh):
+                            duplicate = True
+                            break
             if not duplicate:
                 kept.append((box, conf, cls))
         return kept
@@ -370,27 +386,60 @@ class PersonProcessor:
                 if obj.lost <= 1:
                     active_objects.append(obj)
 
-        # Khử trùng lặp giữa các track đang active (nếu 2 track lồng nhau trên cùng 1 người)
+        # Khử trùng lặp giữa các track đang active (nếu 2 track lồng nhau trên cùng 1 người / xe máy)
+        # Sử dụng khoảng cách song song dọc theo vạch kẻ (line-angle invariant)
         if len(active_objects) > 1:
             sorted_active = sorted(active_objects, key=lambda o: (getattr(o, "counted", False), o.bbox[3], o.conf or 0), reverse=True)
             kept_active = []
             dup_ids = set()
+
+            u_line = None
+            if self._line_points and len(self._line_points) >= 2:
+                p1, p2 = self._line_points[0], self._line_points[1]
+                lx = float(p2[0] - p1[0]); ly = float(p2[1] - p1[1])
+                llen = math.hypot(lx, ly)
+                if llen > 1e-3:
+                    u_line = (lx / llen, ly / llen)
+
             for obj in sorted_active:
                 if obj.id in dup_ids:
                     continue
                 bx, by, bw, bh = obj.bbox
                 ba = bw * bh
+                bcx = bx + bw / 2.0
+                bcy = by + bh / 2.0
                 kept_active.append(obj)
                 for other in sorted_active:
                     if other.id == obj.id or other.id in dup_ids:
                         continue
+                    # Bảo vệ 2 track đã sống đủ lâu song song → 2 người thật
+                    if obj.frame_count >= 12 and other.frame_count >= 12:
+                        continue
                     ox, oy, ow, oh = other.bbox
                     oa = ow * oh
+                    ocx = ox + ow / 2.0
+                    ocy = oy + oh / 2.0
+
+                    # Tính khoảng cách tách biệt dọc theo vạch kẻ
+                    if u_line is not None:
+                        d_parallel = abs((bcx - ocx) * u_line[0] + (bcy - ocy) * u_line[1])
+                        # Nếu đi ở 2 vị trí khác nhau trên vạch kẻ → 2 người riêng biệt!
+                        if d_parallel >= 50.0:
+                            continue
+
                     ix1, iy1 = max(bx, ox), max(by, oy)
                     ix2, iy2 = min(bx + bw, ox + ow), min(by + bh, oy + oh)
                     inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
                     min_a = min(ba, oa)
-                    if min_a > 0 and (inter / min_a) > 0.60:
+
+                    is_overlap = (min_a > 0 and (inter / min_a) > 0.50)
+                    center_dist = math.hypot(bcx - ocx, bcy - ocy)
+                    is_near = (center_dist < max(bw, bh, ow, oh) * 0.65)
+
+                    if is_overlap or is_near:
+                        # Kế thừa trạng thái đã đếm nếu obj đã đếm
+                        if getattr(obj, "counted", False):
+                            other.counted = True
                         dup_ids.add(other.id)
 
             if dup_ids:
@@ -467,28 +516,74 @@ class PersonProcessor:
 
     def _check_line_crossing(self, obj, frame=None, frame_uuid=None):
         """Update per-track hysteresis state and emit a deduplicated crossing."""
-        if not self._line_points:
+        if not self._line_points or getattr(obj, "counted", False):
             return
         if obj.crossing_fsm is None:
+            first_pt = getattr(obj, "first_bottom", None) or obj.curr_bottom
             obj.crossing_fsm = LineZoneCrossingFSM(
                 self._line_points, settings.LINE_BUFFER_PIXELS, self._direction_vector,
-                settings.STATIONARY_DISPLACEMENT_MAX, settings.STATIONARY_FRAMES)
+                settings.MIN_PATH_MOVEMENT_PIXELS, settings.STATIONARY_FRAMES,
+                first_point=first_pt, min_entry_distance=settings.MIN_ENTRY_DISTANCE_LINE)
         point = obj.curr_bottom or obj.curr_center
         event, stationary = obj.crossing_fsm.update(point, obj.bbox)
         if stationary:
             self._stats["gate_movement"] += 1
-        if obj.counted or not event:
+        if not event:
             return
-        min_conf = float(getattr(settings, "CONFIDENT_PERSON", 0.25))
+
+        bx, by, bw, bh = obj.bbox
+        aspect_ratio = float(bw) / float(max(1, bh))
+        bbox_area = float(bw * bh)
+
+        # 1. Cổng Lọc box bị cắt cụt ở viền màn hình (Border Truncation Filter)
+        # Loại bỏ trường hợp chỉ thấy chóp đầu/gáy lọt vào đáy màn hình (H bé hoặc dẹt ngang W/H > 1.2)
+        min_height = int(getattr(settings, "MIN_PERSON_HEIGHT", 110))
+        frame_h = frame.shape[0] if frame is not None else 720
+        if (by + bh >= frame_h - 15) and (bh < min_height or aspect_ratio > 1.20):
+            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: box bị cắt cụt ở mép đáy màn hình "
+                        f"(H={bh} < {min_height}, W/H={aspect_ratio:.2f})")
+            obj.counted = True
+            return
+
+        # 2. Cổng Confidence tối thiểu (lọc các mảnh vỡ sau cột/cây bị che khuất)
+        min_conf = float(getattr(settings, "CONFIDENT_PERSON", 0.40))
         if obj.conf is not None and float(obj.conf) < min_conf:
             return
-        if obj.frame_count < settings.MIN_FRAMES_BEFORE_COUNT:
+
+        # 3. Cổng số frame tối thiểu: không đánh dấu obj.counted để các frame sau tiếp tục được tích lũy
+        min_frames = int(getattr(settings, "MIN_FRAMES_BEFORE_COUNT", 5))
+        if obj.frame_count < min_frames:
             self._stats["gate_frames"] += 1
             return
-        if not self._cooldown.allow(point, obj.bbox, event):
+
+        # 4. Cổng Dịch chuyển thực tế (Net Displacement Gate): Chặn vật thể đứng yên/rung lắc (EC-1, EC-3)
+        min_movement = float(getattr(settings, "MIN_PATH_MOVEMENT_PIXELS", 35.0))
+        first_pt = getattr(obj, "first_bottom", None) or getattr(obj, "first_center", None)
+        net_disp = 0.0
+        if first_pt is not None and point is not None:
+            net_disp = math.hypot(point[0] - first_pt[0], point[1] - first_pt[1])
+            if net_disp < min_movement:
+                self._stats["gate_movement"] += 1
+                return
+
+        # 5. Cổng Dáng hình học Bounding Box: Lọc xe máy đỗ ngang / thùng hàng lớn (EC-4)
+        max_aspect = float(getattr(settings, "MAX_PERSON_ASPECT_RATIO", 0.85))
+        max_area = float(getattr(settings, "MAX_PERSON_AREA", 32000.0))
+        if aspect_ratio > max_aspect and bbox_area > max_area:
+            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: dáng xe máy/thùng hàng bè ngang "
+                        f"(W/H={aspect_ratio:.2f} > {max_aspect}, Area={bbox_area:.0f} > {max_area})")
             obj.counted = True
-            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: spatial cooldown")
             return
+
+        # 6. Cổng Spatial Cooldown (Line-Angle Invariant): Chống đếm lặp 2 box trong 1.8s (EC-5, EC-6)
+        if not self._cooldown.allow(point, obj.bbox, event,
+                                      track_id=obj.id,
+                                      track_frame_count=obj.frame_count,
+                                      line_points=self._line_points):
+            obj.counted = True
+            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: spatial cooldown (trùng lặp vạch)")
+            return
+
         obj.counted = True
         self._stats["counted"] += 1
         self.total_counted += 1
@@ -496,7 +591,7 @@ class PersonProcessor:
         direction_label = "IN" if event == "person_in" else "OUT"
         conf = obj.conf if obj.conf is not None else 0.0
         logger.info(f"[{self.cam_name}] VƯỢT VẠCH {direction_label} — người #{obj.id} "
-                    f"conf={conf:.2f} bbox={obj.bbox} frames={obj.frame_count}")
+                    f"conf={conf:.2f} bbox={obj.bbox} frames={obj.frame_count} disp={net_disp:.1f}px")
         if getattr(settings, "ENABLE_SAVE_IMAGE", True) and frame is not None:
             try:
                 self.image_writer_pool.submit(

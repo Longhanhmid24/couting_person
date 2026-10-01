@@ -11,8 +11,16 @@ class _Track:
     def __init__(self,track_id,det,kf):
         box,self.score,self.cls=det; self.track_id=track_id; self.mean,self.covariance=kf.initiate(box)
         self.hits=1; self.lost=0; self.confirmed=True; self.matched=True
+        b=self.bbox; self._prev_cx=b[0]+b[2]/2; self._prev_cy=b[1]+b[3]/2
+        self.vx=0.0; self.vy=0.0
     @property
     def bbox(self): return KalmanFilter.to_xywh(self.mean)
+    def update_velocity(self):
+        b=self.bbox; cx=b[0]+b[2]/2; cy=b[1]+b[3]/2
+        alpha=0.6
+        self.vx=alpha*(cx-self._prev_cx)+(1-alpha)*self.vx
+        self.vy=alpha*(cy-self._prev_cy)+(1-alpha)*self.vy
+        self._prev_cx=cx; self._prev_cy=cy
 
 class BYTETracker:
     def __init__(self,high_thresh=.4,low_thresh=.1,new_track_thresh=.5,match_thresh=.8,track_buffer=25):
@@ -36,16 +44,37 @@ class BYTETracker:
         # secondary affinity so valid fast moves do not create a fresh ID.
         for ti,track_box in enumerate(track_boxes):
             tcx=track_box[0]+track_box[2]/2; tcy=track_box[1]+track_box[3]/2
+            ta=max(1.0, float(track_box[2] * track_box[3]))
             for ci,det_box in enumerate(det_boxes):
                 dcx=det_box[0]+det_box[2]/2; dcy=det_box[1]+det_box[3]/2
+                da=max(1.0, float(det_box[2] * det_box[3]))
+                ratio=max(ta / da, da / ta)
                 scale=max(track_box[2],track_box[3],det_box[2],det_box[3],1.0)
                 distance=((tcx-dcx)**2+(tcy-dcy)**2)**.5
-                ratio=max(track_box[2]*track_box[3],det_box[2]*det_box[3])/max(1.0,min(track_box[2]*track_box[3],det_box[2]*det_box[3]))
-                if distance>1.5*scale or ratio>4.0:
+                t=tracks[ti]
+                speed=(t.vx**2 + t.vy**2)**0.5
+                max_reach = 1.6 * scale
+                if speed > 2.0 and t.hits >= 3:
+                    dx = dcx - tcx
+                    dy = dcy - tcy
+                    forward_proj = (dx * t.vx + dy * t.vy) / max(speed, 1e-3)
+                    if forward_proj > 0:
+                        max_reach += min(forward_proj * 0.8, 1.2 * scale)
+                if distance > max_reach or ratio > 4.5:
                     cost[ti,ci]=1e6
                 else:
-                    proximity=max(0.0,1.0-distance/(1.5*scale))
-                    cost[ti,ci]=min(cost[ti,ci],1.0-(.2+.8*proximity))
+                    proximity=max(0.0,1.0-distance/max_reach)
+                    base_cost=1.0-(.2+.8*proximity)
+                    # Motion consistency bonus: when the track has velocity
+                    # history, penalise detections that require a sudden
+                    # direction reversal (typical of an ID swap).
+                    if speed>1.0 and t.hits>=3:
+                        dx=dcx-tcx; dy=dcy-tcy
+                        dot=t.vx*dx+t.vy*dy
+                        motion_consistency=max(0.0,min(1.0,dot/(speed*max(distance,1e-6))))
+                        # Blend: up to 25% cost reduction for aligned motion
+                        base_cost=base_cost*(1.0-0.25*motion_consistency)
+                    cost[ti,ci]=min(cost[ti,ci],base_cost)
         pairs,_,_=linear_assignment(cost); accepted=[]
         for ti,ci in pairs:
             if cost[ti,ci]<=self.match_thresh: accepted.append((ti,indices[ci]))
@@ -55,6 +84,7 @@ class BYTETracker:
     def _apply(self,track,det):
         box,track.score,track.cls=det; track.mean,track.covariance=self.kf.update(track.mean,track.covariance,box)
         track.hits+=1; track.lost=0; track.matched=True; track.confirmed=True
+        track.update_velocity()
 
     def update(self,detections,dt=1.0):
         dets=[(tuple(map(float,b)),float(score),cls) for b,score,cls in detections
