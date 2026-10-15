@@ -157,6 +157,7 @@ def send_person_counting_event(
     trajectory: list = None,
     image_width: int = None,
     image_height: int = None,
+    rule_id: str = None,
 ):
     """
     Bắn sự kiện đếm người (kèm ảnh sạch và tọa độ chuẩn hóa) lên CMS qua POST /api/alarms.
@@ -192,10 +193,13 @@ def send_person_counting_event(
         coords["trajectory"] = trajectory
     attrs["coordinates"] = coords
 
+    # Source chuẩn là rule_id để CMS join bảng rules và Web UI / VMS hiển thị card bằng chứng
+    source_val = rule_id or stream_id
+
     return create_alarm(
         stream_id=stream_id,
         type="people_counting",
-        source=stream_id,
+        source=source_val,
         attributes=attrs,
         frame=frame,
         image_base64=image_base64,

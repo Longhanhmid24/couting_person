@@ -40,6 +40,7 @@ def parse_camera_params(cam: dict, rules: list = None):
     )
 
     line_config = rule_cfg.get("line")
+    rule_id = rule_cfg.get("rule_id")
     direction_config = _find_direction_filter(cam_id, rules)
 
     if not line_config:
@@ -53,7 +54,11 @@ def parse_camera_params(cam: dict, rules: list = None):
             f"vui lòng vẽ mũi tên hướng trên CMS UI để phân biệt IN/OUT."
         )
 
-    return {"line_config": line_config, "direction_config": direction_config}
+    return {
+        "line_config": line_config,
+        "direction_config": direction_config,
+        "rule_id": rule_id,
+    }
 
 
 def _find_direction_filter(cam_id: str, rules: list) -> list:
@@ -110,12 +115,14 @@ class CameraPipelineInstance:
         name: Optional[str] = None,
         line_config=None,
         direction_config=None,
+        rule_id: Optional[str] = None,
         queue_size: int = 32,
     ):
         self.cam_id = cam_id
         self.cam_name = name or cam_id
         self.line_config = line_config
         self.direction_config = direction_config
+        self.rule_id = rule_id
         self.shutdown_flag = threading.Event()
 
         # Frame queue cho processor
@@ -132,6 +139,7 @@ class CameraPipelineInstance:
             shutdown_flag=self.shutdown_flag,
             line_config=line_config,
             direction_config=direction_config,
+            rule_id=rule_id,
             cam_name=self.cam_name,
         )
 
@@ -169,17 +177,21 @@ class CameraPipelineInstance:
         for t in self.threads:
             t.start()
 
-    def update_params(self, line_config=None, direction_config=None):
-        """Cập nhật line_config và direction_config động cho camera."""
+    def update_params(self, line_config=None, direction_config=None, rule_id=None):
+        """Cập nhật line_config, direction_config và rule_id động cho camera."""
         self.line_config = line_config
         self.direction_config = direction_config
+        if rule_id is not None:
+            self.rule_id = rule_id
         if hasattr(self, 'person_processor') and self.person_processor is not None:
             self.person_processor.line_config = line_config
             self.person_processor._line_resolved = False
             self.person_processor.direction_config = direction_config
             self.person_processor._direction_resolved = False
             self.person_processor._direction_vector = None
-            LOGGER.info(f"[{self.cam_name}] Đã cập nhật counting line + direction mới")
+            if rule_id is not None:
+                self.person_processor.rule_id = rule_id
+            LOGGER.info(f"[{self.cam_name}] Đã cập nhật counting line + direction mới (rule_id={self.rule_id})")
 
     def stop(self):
         """Drain processor trước, rồi mới cho StatisticsPoster flush lần cuối."""
@@ -269,28 +281,46 @@ class CentralPipeline:
         name: Optional[str] = None,
         line_config=None,
         direction_config=None,
+        rule_id=None,
         **_ignored,
     ):
         with self._lock:
-            self._camera_params[cam_id] = {"line_config": line_config, "direction_config": direction_config}
+            self._camera_params[cam_id] = {
+                "line_config": line_config,
+                "direction_config": direction_config,
+                "rule_id": rule_id,
+            }
             if cam_id not in self.pipelines:
                 instance = CameraPipelineInstance(
                     cam_id=cam_id, name=name, line_config=line_config,
                     direction_config=direction_config,
+                    rule_id=rule_id,
                 )
                 instance.start()
                 self.pipelines[cam_id] = instance
-                LOGGER.info(f"Đã đăng ký pipeline đếm người cho [{name or cam_id}]")
+                LOGGER.info(f"Đã đăng ký pipeline đếm người cho [{name or cam_id}] (rule_id={rule_id})")
             else:
-                self.pipelines[cam_id].update_params(line_config=line_config, direction_config=direction_config)
+                self.pipelines[cam_id].update_params(
+                    line_config=line_config,
+                    direction_config=direction_config,
+                    rule_id=rule_id,
+                )
 
-    def update_params(self, cam_id: str, line_config=None, direction_config=None, **_ignored):
+    def update_params(self, cam_id: str, line_config=None, direction_config=None, rule_id=None, **_ignored):
         with self._lock:
-            self._camera_params[cam_id] = {"line_config": line_config, "direction_config": direction_config}
+            self._camera_params[cam_id] = {
+                "line_config": line_config,
+                "direction_config": direction_config,
+                "rule_id": rule_id,
+            }
             instance = self.pipelines.get(cam_id)
             if instance:
-                instance.update_params(line_config=line_config, direction_config=direction_config)
-                LOGGER.info(f"[{instance.cam_name}] Cập nhật cấu hình line + direction động")
+                instance.update_params(
+                    line_config=line_config,
+                    direction_config=direction_config,
+                    rule_id=rule_id,
+                )
+                LOGGER.info(f"[{instance.cam_name}] Cập nhật cấu hình line + direction động (rule_id={rule_id})")
 
     def get_camera_params(self, cam_id: str) -> dict:
         with self._lock:

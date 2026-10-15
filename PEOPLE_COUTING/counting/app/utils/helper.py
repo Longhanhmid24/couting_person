@@ -305,7 +305,7 @@ def crop_person_image(frame: np.ndarray, bbox, padding_ratio: float = 0.1) -> np
 def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
                                direction_vector=None, direction_label: str = "IN",
                                cam_id: str = "camera", frame_uuid: str = None,
-                               cam_name: str = None) -> dict:
+                               cam_name: str = None, rule_id: str = None) -> dict:
     """Lưu ảnh evidence và crop của người vừa đếm vào thư mục dùng chung (Shared Storage),
     đồng thời đẩy sự kiện kèm ảnh lên CMS qua POST /api/alarms."""
     if not getattr(settings, 'ENABLE_SAVE_IMAGE', True) or frame is None:
@@ -438,6 +438,7 @@ def save_counted_person_images(frame: np.ndarray, obj, line_points=None,
             trajectory=norm_trajectory if norm_trajectory else None,
             image_width=frame_w,
             image_height=frame_h,
+            rule_id=rule_id,
         )
     except Exception as e:
         logger.warning(f"[{cam_id}] Không thể gửi sự kiện đếm người lên CMS: {e}")

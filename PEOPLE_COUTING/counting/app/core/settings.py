@@ -112,8 +112,8 @@ class Settings:
     MIN_PATH_MOVEMENT_PIXELS = float(os.getenv("MIN_PATH_MOVEMENT_PIXELS", 35.0))
     MIN_ENTRY_DISTANCE_LINE = float(os.getenv("MIN_ENTRY_DISTANCE_LINE", 25.0))
     MIN_PERSON_HEIGHT = int(os.getenv("MIN_PERSON_HEIGHT", 110))
-    MAX_PERSON_ASPECT_RATIO = float(os.getenv("MAX_PERSON_ASPECT_RATIO", 0.85))
-    MAX_PERSON_AREA = float(os.getenv("MAX_PERSON_AREA", 32000.0))
+    MAX_PERSON_ASPECT_RATIO = float(os.getenv("MAX_PERSON_ASPECT_RATIO", 1.6))
+    MAX_PERSON_AREA = float(os.getenv("MAX_PERSON_AREA", 65000.0))
     PATH_HISTORY_LEN = int(os.getenv("PATH_HISTORY_LEN", 16))
 
     # ── Statistics ────────────────────────────────────────────────────

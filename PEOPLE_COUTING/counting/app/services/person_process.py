@@ -117,7 +117,7 @@ class PersonProcessor:
     """Detect người + tracking + đếm vượt vạch. Một instance mỗi camera."""
 
     def __init__(self, stream_id, frame_queue, counting_callback, shutdown_flag,
-                 line_config=None, direction_config=None, cam_name=None):
+                 line_config=None, direction_config=None, rule_id=None, cam_name=None):
         self.stream_id = stream_id
         self.cam_name = cam_name or stream_id
         self.client = GRPCClient()
@@ -126,6 +126,7 @@ class PersonProcessor:
         self.shutdown_flag = shutdown_flag
         self.line_config = line_config
         self.direction_config = direction_config
+        self.rule_id = rule_id
 
         self._line_points = None
         self._line_resolved = False
@@ -566,11 +567,11 @@ class PersonProcessor:
                 self._stats["gate_movement"] += 1
                 return
 
-        # 5. Cổng Dáng hình học Bounding Box: Lọc xe máy đỗ ngang / thùng hàng lớn (EC-4)
-        max_aspect = float(getattr(settings, "MAX_PERSON_ASPECT_RATIO", 0.85))
-        max_area = float(getattr(settings, "MAX_PERSON_AREA", 32000.0))
+        # 5. Cổng Dáng hình học Bounding Box: Lọc xe cộ đỗ ngang quá khổ (EC-4)
+        max_aspect = float(getattr(settings, "MAX_PERSON_ASPECT_RATIO", 1.6))
+        max_area = float(getattr(settings, "MAX_PERSON_AREA", 65000.0))
         if aspect_ratio > max_aspect and bbox_area > max_area:
-            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: dáng xe máy/thùng hàng bè ngang "
+            logger.info(f"[{self.cam_name}] Bỏ đếm track #{obj.id}: dáng xe cộ bè ngang "
                         f"(W/H={aspect_ratio:.2f} > {max_aspect}, Area={bbox_area:.0f} > {max_area})")
             obj.counted = True
             return
@@ -591,14 +592,14 @@ class PersonProcessor:
         direction_label = "IN" if event == "person_in" else "OUT"
         conf = obj.conf if obj.conf is not None else 0.0
         logger.info(f"[{self.cam_name}] VƯỢT VẠCH {direction_label} — người #{obj.id} "
-                    f"conf={conf:.2f} bbox={obj.bbox} frames={obj.frame_count} disp={net_disp:.1f}px")
+                    f"conf={conf:.2f} bbox={obj.bbox} frames={obj.frame_count} disp={net_disp:.1f}px (rule_id={self.rule_id})")
         if getattr(settings, "ENABLE_SAVE_IMAGE", True) and frame is not None:
             try:
                 self.image_writer_pool.submit(
                     save_counted_person_images, frame=frame.copy(), obj=CountedPersonSnapshot(obj),
                     line_points=list(self._line_points), direction_vector=self._direction_vector,
                     direction_label=direction_label, cam_id=self.stream_id, frame_uuid=frame_uuid,
-                    cam_name=self.cam_name)
+                    cam_name=self.cam_name, rule_id=self.rule_id)
             except Exception as exc:
                 logger.warning(f"[{self.cam_name}] Không thể submit tác vụ lưu ảnh: {exc}")
         if self.counting_callback:
