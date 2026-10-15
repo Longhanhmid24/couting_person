@@ -19,6 +19,28 @@ from core.settings import settings
 LOGGER = logging.getLogger(__name__)
 
 
+def _normalize_codec(raw: str) -> str:
+    """Chuẩn hoá video_codec từ CMS API.
+
+    Trả về:
+      'H264' — codec H.264 rõ ràng
+      'H265' — codec H.265 / HEVC rõ ràng
+      'auto' — không rõ (None / '' / 'auto' / 'AUTO' / 'null' / chuỗi lạ);
+                reader sẽ tự động nhận diện H264 hoặc H265 qua NAL packet.
+    """
+    if not raw:
+        return 'auto'
+    s = str(raw).strip()
+    if s.lower() in ('none', 'auto', 'null', ''):
+        return 'auto'
+    upper = s.upper()
+    if upper in ('H264', 'AVC', 'H.264', 'MPEG-4 AVC'):
+        return 'H264'
+    if upper in ('H265', 'HEVC', 'H.265', 'MPEG-4 HEVC'):
+        return 'H265'
+    return 'auto'
+
+
 @dataclass
 class FramePacket:
     """Standardized frame output from any camera reader."""
@@ -499,7 +521,8 @@ class DahuaGPUReader(BaseCameraReader):
     """Reads Dahua camera via SDK, decodes on GPU with motion detection."""
 
     def __init__(self, cam_id, output_queue, shutdown_event,
-                 url, port, user, pwd, channel, gpuid=0, codec='h264', **kwargs):
+                 url, port, user, pwd, channel, gpuid=0, codec='h264',
+                 codec_watchdog=0.0, **kwargs):
         super().__init__(cam_id, output_queue, shutdown_event, **kwargs)
         self.url = url
         self.port = port
@@ -507,8 +530,10 @@ class DahuaGPUReader(BaseCameraReader):
         self.pwd = pwd
         self.channel = channel
         self.gpuid = gpuid
-        self.codec = codec
+        self.codec = codec   # 'H264', 'H265', hoặc 'auto'
+        self.codec_watchdog = float(codec_watchdog)  # 0 = không watchdog
         self._viewer = None
+        self._first_frame_seen = False
 
     def _read_loop(self):
         from services.sdk.dha_sdk_realplay import DahuaGPUCameraViewer
@@ -536,12 +561,23 @@ class DahuaGPUReader(BaseCameraReader):
 
                 LOGGER.info(f"[{self.cam_name}] Dahua GPU SDK connected")
                 self.is_connected = True
-                self._register_connect_success()
 
                 last_progress_t = time.monotonic()
                 last_seen_count = -1
+                # Codec watchdog: chỉ áp dụng khi chưa từng thấy frame nào
+                watchdog_deadline = (time.monotonic() + self.codec_watchdog
+                                     if (self.codec_watchdog > 0 and not self._first_frame_seen) else None)
                 while not self.is_stopped() and self._viewer.is_playing:
+                    # Codec watchdog: không có frame đầu tiên sau N giây → codec sai.
+                    if watchdog_deadline is not None and time.monotonic() > watchdog_deadline and not self._first_frame_seen:
+                        raise RuntimeError(f"codec_watchdog: no frame received within {self.codec_watchdog}s (codec={self.codec}) — likely codec_mismatch")
+
                     frame, motion = self._viewer.decode_next_packet()
+                    if frame is not None:
+                        if not self._first_frame_seen:
+                            self._first_frame_seen = True
+                            self._register_connect_success()
+
                     if not getattr(settings, 'USE_MOTION_DETECTOR', False):
                         motion = True
                     if motion and frame is not None:
@@ -563,6 +599,10 @@ class DahuaGPUReader(BaseCameraReader):
 
             except Exception as exc:
                 LOGGER.error(f"[{self.cam_name}] Dahua GPU SDK error: {exc}")
+                if 'codec_watchdog' in str(exc):
+                    LOGGER.warning(
+                        f"[{self.cam_name}] Dahua GPU watchdog: chưa nhận được frame sau {self.codec_watchdog:.0f}s — "
+                        f"đang thử lại trên GPU (lần {self._connect_failures + 1}/{self.max_connect_attempts})")
             finally:
                 self.is_connected = False
                 self._release_viewer()
@@ -570,8 +610,8 @@ class DahuaGPUReader(BaseCameraReader):
             self._register_connect_failure()
             if self._should_give_up():
                 LOGGER.warning(
-                    f"[{self.cam_name}] Dahua GPU SDK: bỏ cuộc sau "
-                    f"{self._connect_failures} lần thử, nhường cho reader dự phòng")
+                    f"[{self.cam_name}] Dahua GPU SDK: không decode được sau "
+                    f"{self._connect_failures} lần thử, nhường cho CPU reader dự phòng")
                 return
             if not self.is_stopped():
                 self._backoff_sleep()
@@ -745,7 +785,12 @@ class DahuaAutoReader(BaseCameraReader):
         if active:
             active.frame_count = val
 
-    def _read_loop(self):
+    def _run_with_codec(self, codec: str) -> bool:
+        """Chạy Dahua GPU reader với codec cố định. Trả True nếu nhận được ≥1 frame.
+
+        Watchdog 5s: nếu không có frame nào trong 5s đầu tiên → coi như codec
+        sai và trả False để DahuaAutoReader thử codec khác.
+        """
         gpu_available = False
         try:
             gpu_available = torch.cuda.is_available()
@@ -753,35 +798,82 @@ class DahuaAutoReader(BaseCameraReader):
             pass
 
         force_cpu = getattr(settings, 'FORCE_CPU_DECODE', False)
-        primary_attempts = int(getattr(settings, 'PRIMARY_CONNECT_ATTEMPTS', 2))
+        primary_attempts = int(getattr(settings, 'PRIMARY_CONNECT_ATTEMPTS', 4))
 
-        # 1. Primary Attempt: Dahua GPU Reader (PyNvVideoCodec NVDEC)
-        if gpu_available and not force_cpu:
-            LOGGER.info(f"[{self.cam_name}] Dahua Primary Attempt: Dahua GPU Reader ({self.url}:{self.port})...")
-            gpu_reader = DahuaGPUReader(
+        if not gpu_available or force_cpu:
+            return False
+
+        reader = DahuaGPUReader(
+            self.cam_id, self.output_queue, self.shutdown,
+            url=self.url, port=self.port, user=self.user, pwd=self.pwd,
+            channel=self.channel, codec=codec, gpuid=self.gpuid,
+            name=self.cam_name,
+            motion_threshold=self.motion_threshold,
+            motion_alpha=self.motion_alpha,
+            min_motion_pixels=self.min_motion_pixels,
+            max_connect_attempts=primary_attempts,
+            codec_watchdog=20.0,  # 20s: không frame → tính là 1 lần thử lỗi
+        )
+        self._active_reader = reader
+        try:
+            reader._read_loop()
+            if self.is_stopped():
+                return True
+            if getattr(reader, '_first_frame_seen', False):
+                # Chạy được và đã nhận frame → chấp nhận codec này
+                return True
+            return False
+        except Exception as e:
+            LOGGER.warning(f"[{self.cam_name}] Dahua GPU codec={codec} failed: {e}")
+            return False
+        finally:
+            if not getattr(reader, '_first_frame_seen', False):
+                try:
+                    reader.stop()
+                    reader._cleanup()
+                except Exception:
+                    pass
+                self._active_reader = None
+
+    def _read_loop(self):
+        if self.codec == 'auto':
+            # AUTO: DahuaGPUReader tự động nhận diện codec H264/H265 từ NAL packet
+            LOGGER.info(f"[{self.cam_name}] Dahua AUTO: dynamic sniffing stream codec (H264/H265) ...")
+            if self._run_with_codec('auto'):
+                return
+            LOGGER.warning(f"[{self.cam_name}] Dahua AUTO: GPU auto probe failed — falling back to Dahua CPU Reader ...")
+            # Fallback to CPU with auto probe
+            cpu_reader = DahuaCPUReader(
                 self.cam_id, self.output_queue, self.shutdown,
                 url=self.url, port=self.port, user=self.user, pwd=self.pwd,
-                channel=self.channel, codec=self.codec, gpuid=self.gpuid,
+                channel=self.channel, codec='auto',
                 name=self.cam_name,
                 motion_threshold=self.motion_threshold,
                 motion_alpha=self.motion_alpha,
                 min_motion_pixels=self.min_motion_pixels,
-                max_connect_attempts=primary_attempts,
             )
-            self._active_reader = gpu_reader
-            try:
-                gpu_reader._read_loop()
-                if self.is_stopped():
-                    return
-                if gpu_reader._ever_connected:
-                    # Đã từng chạy được bằng GPU: reader GPU tự retry vô hạn, việc
-                    # nó trả về ở đây nghĩa là stop() — không cần fallback.
-                    return
-            except Exception as e:
-                LOGGER.warning(f"[{self.cam_name}] Dahua GPU reader failed: {e}. Falling back to Dahua CPU Reader...")
+            self._active_reader = cpu_reader
+            cpu_reader._read_loop()
+            return
 
-        # 2. Fallback Attempt: Dahua CPU Reader (FFmpeg pipe)
-        LOGGER.info(f"[{self.cam_name}] Dahua Fallback Attempt: Dahua CPU Reader ({self.url}:{self.port})...")
+        # Codec cố định (H264 hoặc H265)
+        gpu_available = False
+        try:
+            gpu_available = torch.cuda.is_available()
+        except Exception:
+            pass
+
+        force_cpu = getattr(settings, 'FORCE_CPU_DECODE', False)
+
+        # 1. Primary: Dahua GPU Reader
+        if gpu_available and not force_cpu:
+            LOGGER.info(f"[{self.cam_name}] Dahua Primary: GPU Reader codec={self.codec} ...")
+            if self._run_with_codec(self.codec):
+                return
+            LOGGER.warning(f"[{self.cam_name}] Dahua GPU codec={self.codec} failed — falling back to CPU Reader...")
+
+        # 2. Fallback: Dahua CPU Reader (FFmpeg)
+        LOGGER.info(f"[{self.cam_name}] Dahua Fallback: CPU Reader codec={self.codec} ...")
         cpu_reader = DahuaCPUReader(
             self.cam_id, self.output_queue, self.shutdown,
             url=self.url, port=self.port, user=self.user, pwd=self.pwd,
@@ -1155,7 +1247,8 @@ def create_reader(cam_id: str, cam_config: dict,
     cam_name = cam_config.get('name') or cam_id
 
     if use_sdk == 1:
-        codec = cam_config.get('codec') or cam_config.get('stream_codec') or 'h264'
+        codec = _normalize_codec(
+            cam_config.get('video_codec') or cam_config.get('codec') or cam_config.get('stream_codec'))
         sdk_kw = dict(
             url=cam_config.get('storage_url') or cam_config.get('url'),
             port=int(cam_config['storage_port']) if cam_config.get('storage_port') else 37777,
@@ -1164,17 +1257,19 @@ def create_reader(cam_id: str, cam_config: dict,
             channel=int(cam_config['storage_channel']) if cam_config.get('storage_channel') else 1,
             codec=codec,
         )
-        if manufacturer in ('hik', 'hikvision'):
+        LOGGER.info(f"[{cam_name}] video_codec={codec} (raw={cam_config.get('video_codec')!r})")
+        if manufacturer == 'dahua':
+            return DahuaAutoReader(
+                cam_id, output_queue, shutdown_event,
+                name=cam_name, gpuid=gpuid, **sdk_kw, **motion_kw)
+        elif manufacturer == 'hik':
             rtsp_url = cam_config.get('url') or ''
             return HIKAutoReader(
                 cam_id, output_queue, shutdown_event,
                 rtsp_url=rtsp_url, name=cam_name, gpuid=gpuid,
                 **sdk_kw, **motion_kw)
         else:
-            # Dahua, KBVision, Kabevision, Kabe và các hãng OEM Dahua đều dùng Dahua SDK
-            return DahuaAutoReader(
-                cam_id, output_queue, shutdown_event,
-                name=cam_name, gpuid=gpuid, **sdk_kw, **motion_kw)
+            LOGGER.warning(f"Unknown manufacturer '{manufacturer}', using RTSP fallback")
 
     # RTSP mode
     rtsp_url = cam_config.get('url', '')

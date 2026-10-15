@@ -16,6 +16,7 @@ from NetSDK.SDK_Struct import (C_LLONG, NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY,
                               NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY, LOG_SET_PRINT_INFO)
 
 decoding_lock = threading.Lock()
+sdk_login_lock = threading.Lock()
 
 def nv12_to_bgr_torch(nv12_tensor, H, W, max_dim=1280):
     """
@@ -52,12 +53,68 @@ def nv12_to_bgr_torch(nv12_tensor, H, W, max_dim=1280):
     return torch.clamp(bgr, 0, 255).byte()
 
 
+def detect_nal_codec(raw_bytes: bytes):
+    """
+    Phát hiện chuẩn xác định dạng codec (H.264 hoặc H.265 / HEVC) từ NAL bitstream header.
+    
+    Quy tắc phân định chuẩn ISO/IEC 14496-10 (AVC) và ISO/IEC 23008-2 (HEVC):
+    1. H.265 (HEVC) Parameter Sets:
+       - VPS (Video Parameter Set, nal_type=32): byte0 = 0x40/0x41, byte1 có temporal_id != 0.
+         (VPS CHỈ TỒN TẠI trong HEVC, H.264 KHÔNG CÓ VPS).
+       - SPS (nal_type=33): byte0 = 0x42/0x43, byte1 có temporal_id != 0.
+       - PPS (nal_type=34): byte0 = 0x44/0x45, byte1 có temporal_id != 0.
+    2. H.264 (AVC) Parameter Sets:
+       - SPS (nal_type=7): (byte0 & 0x1F) == 7 (thường byte0 = 0x27, 0x47, 0x67).
+       - PPS (nal_type=8): (byte0 & 0x1F) == 8 (thường byte0 = 0x28, 0x48, 0x68).
+    3. IDR frames:
+       - H.265 IDR (nal_type=19, 20): byte0 chẵn (0x26 hoặc 0x28) và byte1 = 0x01.
+       - H.264 IDR (nal_type=5): (byte0 & 0x1F) == 5 (0x25, 0x45, 0x65).
+    """
+    if not raw_bytes or len(raw_bytes) < 6:
+        return None
+
+    start_search = 4 if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) else 0
+    idx = raw_bytes.find(b'\x00\x00\x00\x01', start_search)
+    prefix_len = 4
+    if idx == -1:
+        idx = raw_bytes.find(b'\x00\x00\x01', start_search)
+        prefix_len = 3
+    if idx == -1 or idx + prefix_len + 1 >= len(raw_bytes):
+        return None
+
+    b0 = raw_bytes[idx + prefix_len]
+    b1 = raw_bytes[idx + prefix_len + 1]
+
+    h264_type = b0 & 0x1F
+    h265_type = (b0 >> 1) & 0x3F
+
+    # 1. H.265 Parameter Sets (VPS=32, SPS=33, PPS=34)
+    # Temporal ID trong HEVC luôn > 0 ((b1 & 0x07) != 0)
+    if h265_type in (32, 33, 34) and (b1 & 0x07) != 0:
+        return 'h265'
+
+    # 2. H.264 Parameter Sets (SPS=7, PPS=8)
+    if h264_type in (7, 8):
+        return 'h264'
+
+    # 3. H.265 IDR slices (19=IDR_W_RADL, 20=IDR_N_LP)
+    # Trong HEVC bit0 của byte0 là nuh_layer_id_hi (=0), và byte1 có temporal_id=1 (0x01)
+    if h265_type in (19, 20) and (b0 & 0x01 == 0) and b1 == 0x01:
+        return 'h265'
+
+    # 4. H.264 IDR slice (5)
+    if h264_type == 5:
+        return 'h264'
+
+    return None
+
+
 class DahuaCameraViewer:
     def __init__(self, codec='h264'):
         self.loginID = C_LLONG()
         self.playID = C_LLONG()
         self.sdk = NetClient()
-        self.codec = codec.lower() if codec else 'h264'
+        self.codec = (codec or 'h264').lower() if codec else 'h264'
         self.m_DisConnectCallBack = fDisConnect(self.on_disconnect)
         self.m_ReConnectCallBack = fHaveReConnect(self.on_reconnect)
         self.m_RealDataCallBack = fRealDataCallBackEx2(self.on_frame_data)
@@ -72,6 +129,9 @@ class DahuaCameraViewer:
         self.frame_width = None
         self.frame_height = None
         self.resolution_event = threading.Event()
+        self.pending_packets = []
+        self.decoder_ready = False
+        self.device_info = None
         self.sdk.InitEx(self.m_DisConnectCallBack)
         self.sdk.SetAutoReconnect(self.m_ReConnectCallBack)
 
@@ -89,8 +149,10 @@ class DahuaCameraViewer:
         stuInParam.emSpecCap = EM_LOGIN_SPAC_CAP_TYPE.TCP
         stuOutParam = NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY()
         stuOutParam.dwSize = sizeof(NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY)
-        self.loginID, device_info, error_msg = self.sdk.LoginWithHighLevelSecurity(stuInParam, stuOutParam)
+        with sdk_login_lock:
+            self.loginID, device_info, error_msg = self.sdk.LoginWithHighLevelSecurity(stuInParam, stuOutParam)
         if self.loginID != 0:
+            self.device_info = device_info
             self.is_connected = True
             print(f"Connected successfully! Channels: {device_info.nChanNum}")
             return True
@@ -105,6 +167,13 @@ class DahuaCameraViewer:
         if self.playID:
             print("Stream already started!")
             return True
+
+        # Tự động clamp channel về 0 nếu camera đơn kênh hoặc channel vượt quá nChanNum
+        if hasattr(self, 'device_info') and self.device_info and self.device_info.nChanNum > 0:
+            if channel >= self.device_info.nChanNum:
+                print(f"[Dahua CPU] Channel {channel} exceeds device channel count {self.device_info.nChanNum}. Clamping channel to 0.")
+                channel = 0
+
         print(f"Starting stream on channel {channel}...")
         play_type = SDK_RealPlayType.Realplay if stream_type == 0 else SDK_RealPlayType.Realplay_1
         self.playID = self.sdk.RealPlayEx(self.loginID, channel, 0, play_type)
@@ -112,7 +181,13 @@ class DahuaCameraViewer:
             self.sdk.SetRealDataCallBackEx2(self.playID, self.m_RealDataCallBack, None, EM_REALDATA_FLAG.RAW_DATA)
             self.is_playing = True
             print("Stream started successfully!")
-            self.setup_decoder(codec_hint=self.codec)
+            self.pending_packets = []
+            if self.codec != 'auto':
+                self.setup_decoder(codec_hint=self.codec)
+                self.decoder_ready = True
+            else:
+                self.decoder_ready = False
+                print("Waiting for first video packet to auto-detect codec for FFmpeg...")
             return True
         else:
             print(f"Failed to start stream: {self.sdk.GetLastErrorMessage()}")
@@ -120,14 +195,24 @@ class DahuaCameraViewer:
 
     def setup_decoder(self, codec_hint='h264'):
         try:
-            cmd = [
-                'ffmpeg', '-hwaccel', 'none', '-fflags', 'nobuffer', '-flags', 'low_delay',
-                '-probesize', '100000', '-analyzeduration', '100000',
+            self.resolution_event.clear()
+            self.frame_width = None
+            self.frame_height = None
+            codec_lower = (codec_hint or 'h264').lower()
+            if codec_lower in ('hevc', 'h265'):
+                input_opts = ['-f', 'hevc',
+                              '-fflags', 'nobuffer', '-flags', 'low_delay',
+                              '-probesize', '1000000', '-analyzeduration', '1000000']
+            else:
+                input_opts = ['-f', 'h264',
+                              '-fflags', 'nobuffer', '-flags', 'low_delay',
+                              '-probesize', '1000000', '-analyzeduration', '1000000']
+            cmd = ['ffmpeg', '-hwaccel', 'none'] + input_opts + [
                 '-i', 'pipe:0', '-f', 'rawvideo', '-pix_fmt', 'bgr24',
                 '-an', '-loglevel', 'info', 'pipe:1'
             ]
-            self.current_codec = codec_hint
-            print(f"Setting up auto-detect FFmpeg decoder for stream...")
+            self.current_codec = codec_lower
+            print(f"Setting up FFmpeg decoder for stream (format={input_opts[1]})...")
             self.ffmpeg_process = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
             )
@@ -170,8 +255,12 @@ class DahuaCameraViewer:
             
     def decode_frames(self):
         print("⏳ Decoder thread started, waiting for resolution signal...")
-        if not self.resolution_event.wait(timeout=10):
+        if not self.resolution_event.wait(timeout=20):
             print("❌ Timed out waiting for resolution. Decoder thread will exit.")
+            self.is_playing = False
+            return
+        if not self.frame_width or not self.frame_height:
+            print("⚠️ Resolution could not be determined. Decoder thread will exit.")
             self.is_playing = False
             return
         bytes_per_frame = self.frame_width * self.frame_height * 3
@@ -199,6 +288,8 @@ class DahuaCameraViewer:
             self.sdk.StopRealPlayEx(self.playID)
             self.playID = 0
         self.is_playing = False
+        self.decoder_ready = False
+        self.pending_packets.clear()
         if self.ffmpeg_process:
             try:
                 if self.ffmpeg_process.stdin: self.ffmpeg_process.stdin.close()
@@ -232,14 +323,51 @@ class DahuaCameraViewer:
         if lRealHandle == self.playID and dwDataType == 0:
             data = cast(pBuffer, POINTER(c_ubyte * dwBufSize)).contents
             raw_bytes = bytes(data)
-            if self.ffmpeg_process and self.ffmpeg_process.stdin and not self.ffmpeg_process.stdin.closed:
-                try:
-                    self.ffmpeg_process.stdin.write(raw_bytes)
-                    self.ffmpeg_process.stdin.flush()
-                except (BrokenPipeError, OSError):
-                    pass
-                except Exception as e:
-                    print(f"Error writing to ffmpeg stdin: {e}")
+
+            # Lọc bỏ hoàn toàn các gói không phải video (0xf0: audio, 0xf1: metadata/IVS)
+            if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) and len(raw_bytes) > 4:
+                if raw_bytes[4] not in (0xfc, 0xfd):
+                    return
+
+            start_search = 4 if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) else 0
+            idx = raw_bytes.find(b'\x00\x00\x00\x01', start_search)
+            if idx == -1:
+                idx = raw_bytes.find(b'\x00\x00\x01', start_search)
+            if idx != -1:
+                raw_bytes = raw_bytes[idx:]
+                
+                # Nếu chưa khởi tạo decoder (do chế độ auto) -> phát hiện codec từ NAL parameter sets
+                if not self.decoder_ready:
+                    detected = detect_nal_codec(raw_bytes)
+                    if detected is not None:
+                        detected_codec = 'hevc' if detected == 'h265' else 'h264'
+                        print(f"[Dahua CPU] Auto-detected stream codec for FFmpeg: {detected.upper()}")
+                    else:
+                        self.pending_packets.append(raw_bytes)
+                        if len(self.pending_packets) > 50:
+                            detected_codec = 'h264'
+                            print("[Dahua CPU] Inconclusive NALs after 50 packets, defaulting to H.264 for FFmpeg...")
+                        else:
+                            return
+                    
+                    self.setup_decoder(codec_hint=detected_codec)
+                    self.decoder_ready = True
+                    for p in self.pending_packets:
+                        if self.ffmpeg_process and self.ffmpeg_process.stdin and not self.ffmpeg_process.stdin.closed:
+                            try:
+                                self.ffmpeg_process.stdin.write(p)
+                            except Exception:
+                                pass
+                    self.pending_packets.clear()
+
+                if self.ffmpeg_process and self.ffmpeg_process.stdin and not self.ffmpeg_process.stdin.closed:
+                    try:
+                        self.ffmpeg_process.stdin.write(raw_bytes)
+                        self.ffmpeg_process.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        pass
+                    except Exception as e:
+                        print(f"Error writing to ffmpeg stdin: {e}")
 
     def get_frame(self):
         with self.frame_lock:
@@ -257,7 +385,15 @@ class DahuaGPUCameraViewer:
         self.playID = C_LLONG()
         self.sdk = NetClient()
         self.gpuid = gpuid
-        self.codec = codec.lower()
+        
+        raw_c = (codec or 'auto').lower()
+        if raw_c in ('hevc', 'h265', 'h.265'):
+            self.configured_codec = 'h265'
+        elif raw_c in ('h264', 'avc', 'h.264'):
+            self.configured_codec = 'h264'
+        else:
+            self.configured_codec = 'auto'
+        self.codec = self.configured_codec
         
         self.motion_detect = motion_detect
         self.motion_threshold = motion_threshold
@@ -271,8 +407,9 @@ class DahuaGPUCameraViewer:
         self.m_RealDataCallBack = fRealDataCallBackEx2(self.on_frame_data)
         
         import queue
-        self.packet_queue = queue.Queue(maxsize=10)
+        self.packet_queue = queue.Queue(maxsize=150)
         self.frame_lock = threading.Lock()
+        self.decode_lock = threading.Lock()
         self.latest_frame_bgr = None
         self.frame_count = 0
         self.fps = 0.0
@@ -280,6 +417,7 @@ class DahuaGPUCameraViewer:
         self.is_connected = False
         self.is_playing = False
         self.decoder = None
+        self.waiting_for_keyframe = True
         
         self.last_frame_decoded_time = 0.0
         self.t_last_fps = 0.0
@@ -305,8 +443,10 @@ class DahuaGPUCameraViewer:
         stuOutParam = NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY()
         stuOutParam.dwSize = sizeof(NET_OUT_LOGIN_WITH_HIGHLEVEL_SECURITY)
         
-        self.loginID, device_info, error_msg = self.sdk.LoginWithHighLevelSecurity(stuInParam, stuOutParam)
+        with sdk_login_lock:
+            self.loginID, device_info, error_msg = self.sdk.LoginWithHighLevelSecurity(stuInParam, stuOutParam)
         if self.loginID != 0:
+            self.device_info = device_info
             self.is_connected = True
             print(f"[Dahua GPU] Connected successfully! Channels: {device_info.nChanNum}")
             return True
@@ -321,6 +461,12 @@ class DahuaGPUCameraViewer:
         if self.playID:
             print("[Dahua GPU] Stream already started!")
             return True
+
+        # Tự động clamp channel về 0 nếu camera đơn kênh hoặc channel vượt quá nChanNum
+        if hasattr(self, 'device_info') and self.device_info and self.device_info.nChanNum > 0:
+            if channel >= self.device_info.nChanNum:
+                print(f"[Dahua GPU] Channel {channel} exceeds device channel count {self.device_info.nChanNum}. Clamping channel to 0.")
+                channel = 0
             
         print(f"[Dahua GPU] Starting stream on channel {channel}...")
         play_type = SDK_RealPlayType.Realplay if stream_type == 0 else SDK_RealPlayType.Realplay_1
@@ -353,6 +499,12 @@ class DahuaGPUCameraViewer:
         if lRealHandle == self.playID and dwDataType == 0:
             data = cast(pBuffer, POINTER(c_ubyte * dwBufSize)).contents
             raw_bytes = bytes(data)
+
+            # Lọc bỏ hoàn toàn các gói không phải video (0xf0: audio, 0xf1: metadata/IVS)
+            if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) and len(raw_bytes) > 4:
+                if raw_bytes[4] not in (0xfc, 0xfd):
+                    return
+
             try:
                 self.packet_queue.put_nowait(raw_bytes)
             except queue.Full:
@@ -370,14 +522,59 @@ class DahuaGPUCameraViewer:
         import torch.nn.functional as F
         import cv2
         
+        try:
+            raw_bytes = self.packet_queue.get(timeout=0.01)
+        except queue.Empty:
+            return None, False
+            
+        if not raw_bytes or len(raw_bytes) < 5:
+            return None, False
+            
+        start_search = 4 if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) else 0
+        is_dhav_key = (len(raw_bytes) > 4 and raw_bytes[4] == 0xfd) if start_search == 4 else False
+        idx = raw_bytes.find(b'\x00\x00\x00\x01', start_search)
+        prefix_len = 4
+        if idx == -1:
+            idx = raw_bytes.find(b'\x00\x00\x01', start_search)
+            prefix_len = 3
+            
+        # Lọc bỏ gói không có NAL start code (audio, metadata, heartbeat)
+        if idx == -1 or idx + prefix_len >= len(raw_bytes):
+            return None, False
+            
+        raw_bytes = raw_bytes[idx:]
+        nal_byte = raw_bytes[prefix_len]
+        h264_type = nal_byte & 0x1F
+        h265_type = (nal_byte >> 1) & 0x3F
+        
+        # IDR keyframe thực sự mang đầy đủ dữ liệu khung hình Intra:
+        # Trong H.264: IDR = 5 hoặc DHAV header type 0xfd
+        # Trong H.265: IDR/IRAP (16..21) hoặc DHAV header type 0xfd
+        is_idr_h265 = (16 <= h265_type <= 21) or is_dhav_key
+        is_idr_h264 = (h264_type == 5) or is_dhav_key
+        
+        # Khởi tạo Decoder
         if self.decoder is None:
+            if self.configured_codec == 'auto':
+                # Chế độ AUTO: Tự động phát hiện codec từ NAL parameter sets
+                detected = detect_nal_codec(raw_bytes)
+                if detected is not None:
+                    self.codec = detected
+                    print(f"[Dahua GPU] Auto-detected stream codec: {self.codec.upper()}")
+                else:
+                    # Chưa thấy parameter set (VPS/SPS), đợi tiếp để xác định đúng chuẩn
+                    return None, False
+            else:
+                # CMS chỉ định rõ H264 hoặc H265 -> tuân thủ 100%
+                self.codec = self.configured_codec
+
             print("[Dahua GPU] Lazy init: Loading GPUMotionDetector...")
             from services.motion_detector import GPUMotionDetector
             print("[Dahua GPU] Lazy init: Setting CUDA device...")
             torch.cuda.set_device(self.gpuid)
             print("[Dahua GPU] Lazy init: CUDA device set.")
-            print(f"[Dahua GPU] Lazy init: Creating PyNvVideoCodec Decoder ({self.codec})...")
-            codec_id = nvc.cudaVideoCodec.HEVC if self.codec in ('hevc', 'h265') else nvc.cudaVideoCodec.H264
+            print(f"[Dahua GPU] Lazy init: Creating PyNvVideoCodec Decoder ({self.codec.upper()})...")
+            codec_id = nvc.cudaVideoCodec.HEVC if self.codec.upper() in ('HEVC', 'H265') else nvc.cudaVideoCodec.H264
             with decoding_lock:
                 self.decoder = nvc.CreateDecoder(
                     gpuid=self.gpuid,
@@ -385,6 +582,7 @@ class DahuaGPUCameraViewer:
                     usedevicememory=True
                 )
             print("[Dahua GPU] Lazy init: Decoder created.")
+            self.waiting_for_keyframe = True
             
             if self.motion_detect and self.detector is None:
                 print("[Dahua GPU] Lazy init: Creating GPUMotionDetector instance...")
@@ -397,29 +595,16 @@ class DahuaGPUCameraViewer:
                     dtype=torch.float16
                 )
                 print("[Dahua GPU] Lazy init: GPUMotionDetector created.")
+
+        # Cơ chế chờ Keyframe đầu tiên trước khi decode để triệt tiêu bóng ma / vỡ hình
+        if self.waiting_for_keyframe:
+            is_key = is_idr_h265 if self.codec in ('h265', 'hevc') else is_idr_h264
+            if not is_key:
+                # Bỏ qua P-frame này khi chưa có Keyframe tham chiếu
+                return None, False
+            self.waiting_for_keyframe = False
+            print(f"[Dahua GPU] Keyframe acquired for {self.codec.upper()}, starting clean decode!")
         
-        try:
-            raw_bytes = self.packet_queue.get(timeout=0.01)
-        except queue.Empty:
-            return None, False
-            
-        if len(raw_bytes) == 0:
-            return None, False
-            
-        if raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav'):
-            idx = raw_bytes.find(b'\x00\x00\x00\x01', 4)
-            if idx != -1:
-                raw_bytes = raw_bytes[idx:]
-            else:
-                idx = raw_bytes.find(b'\x00\x00\x01', 4)
-                if idx != -1:
-                    raw_bytes = raw_bytes[idx:]
-                elif len(raw_bytes) > 32:
-                    raw_bytes = raw_bytes[32:]
-                    
-        if len(raw_bytes) == 0:
-            return None, False
-            
         c_data = (c_ubyte * len(raw_bytes)).from_buffer_copy(raw_bytes)
         p_data = nvc.PacketData()
         p_data.bsl_data = cast(c_data, c_void_p).value
@@ -431,7 +616,7 @@ class DahuaGPUCameraViewer:
         motion_detected_flag = True
         
         try:
-            with decoding_lock:
+            with self.decode_lock:
                 if self.decoder is None:
                     return None, False
                 decoded_frames = self.decoder.Decode(p_data)
@@ -440,8 +625,9 @@ class DahuaGPUCameraViewer:
                     decoded_frame = decoded_frames[-1]
                     gpu_tensor_raw = torch.from_dlpack(decoded_frame)
                     
+                    raw_height, raw_width = gpu_tensor_raw.shape[:2]
+                    
                     if self.motion_detect and self.detector is not None:
-                        raw_height, raw_width = gpu_tensor_raw.shape[:2]
                         stream_height = raw_height * 2 // 3
                         y_channel = gpu_tensor_raw[:stream_height, :]
                         
@@ -499,7 +685,7 @@ class DahuaGPUCameraViewer:
                         
                 with decoding_lock:
                     self.decoder = None
-                    codec_id = nvc.cudaVideoCodec.HEVC if self.codec in ('hevc', 'h265') else nvc.cudaVideoCodec.H264
+                    codec_id = nvc.cudaVideoCodec.HEVC if self.codec.upper() in ('HEVC', 'H265') else nvc.cudaVideoCodec.H264
                     self.decoder = nvc.CreateDecoder(
                         gpuid=self.gpuid,
                         codec=codec_id,
@@ -507,8 +693,9 @@ class DahuaGPUCameraViewer:
                     )
                 if self.detector is not None:
                     self.detector.reset()
+                self.waiting_for_keyframe = True
                 self.last_frame_decoded_time = time.time()
-                print("[Dahua GPU] Decoder successfully re-created and packet queue cleared.")
+                print("[Dahua GPU] Decoder successfully re-created and packet queue cleared (waiting for Keyframe).")
             except Exception as rec_err:
                 print(f"[Dahua GPU] Failed to re-create decoder: {rec_err}")
             return None, False
