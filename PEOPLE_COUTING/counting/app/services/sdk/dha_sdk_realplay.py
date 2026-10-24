@@ -73,40 +73,46 @@ def detect_nal_codec(raw_bytes: bytes):
     if not raw_bytes or len(raw_bytes) < 6:
         return None
 
-    start_search = 4 if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) else 0
-    idx = raw_bytes.find(b'\x00\x00\x00\x01', start_search)
-    prefix_len = 4
-    if idx == -1:
-        idx = raw_bytes.find(b'\x00\x00\x01', start_search)
-        prefix_len = 3
-    if idx == -1 or idx + prefix_len + 1 >= len(raw_bytes):
-        return None
+    # Quét MỌI NAL trong gói (tối đa 64 NAL). Camera Dahua hay đặt AUD/SEI ở đầu
+    # gói, SPS/PPS/VPS nằm phía sau — bản cũ chỉ xem NAL đầu nên không bao giờ
+    # thấy parameter set ("Inconclusive NALs after 50 packets").
+    pos = 4 if (raw_bytes.startswith(b'DHAV') or raw_bytes.startswith(b'dhav')) else 0
+    idr_guess = None
+    h264_ps = False
+    n = len(raw_bytes)
+    for _ in range(64):
+        idx = raw_bytes.find(b'\x00\x00\x01', pos)
+        if idx == -1 or idx + 4 >= n:
+            break
+        b0 = raw_bytes[idx + 3]
+        b1 = raw_bytes[idx + 4]
+        pos = idx + 3
 
-    b0 = raw_bytes[idx + prefix_len]
-    b1 = raw_bytes[idx + prefix_len + 1]
+        h264_type = b0 & 0x1F
+        h265_type = (b0 >> 1) & 0x3F
 
-    h264_type = b0 & 0x1F
-    h265_type = (b0 >> 1) & 0x3F
+        # 1. H.265 Parameter Sets (VPS=32, SPS=33, PPS=34)
+        # Chuẩn HEVC: parameter set luôn có nuh_layer_id=0 và TemporalId=0, tức byte0
+        # bit0 = 0 và byte1 == 0x01 (nuh_temporal_id_plus1 = 1). Bản cũ chỉ đòi
+        # (b1 & 7) != 0 nên P-slice H.264 (0x41 0x9a...) bị nhận nhầm là VPS H.265.
+        if h265_type in (32, 33, 34) and (b0 & 0x81) == 0 and b1 == 0x01:
+            return 'h265'
 
-    # 1. H.265 Parameter Sets (VPS=32, SPS=33, PPS=34)
-    # Temporal ID trong HEVC luôn > 0 ((b1 & 0x07) != 0)
-    if h265_type in (32, 33, 34) and (b1 & 0x07) != 0:
-        return 'h265'
+        # 2. H.264 Parameter Sets (SPS=7, PPS=8); forbidden_zero_bit = 0. Ghi nhận
+        # rồi quét tiếp: 0x28 0x01 cũng là IDR_N_LP của H.265, VPS có thể ở sau.
+        if (b0 & 0x80) == 0 and h264_type in (7, 8) and not (b0 == 0x28 and b1 == 0x01):
+            h264_ps = True
 
-    # 2. H.264 Parameter Sets (SPS=7, PPS=8)
-    if h264_type in (7, 8):
+        # 3./4. IDR slice — chỉ dùng khi cả gói không có parameter set nào
+        if idr_guess is None:
+            if h265_type in (19, 20) and (b0 & 0x81) == 0 and b1 == 0x01:
+                idr_guess = 'h265'
+            elif (b0 & 0x80) == 0 and h264_type == 5:
+                idr_guess = 'h264'
+
+    if h264_ps:
         return 'h264'
-
-    # 3. H.265 IDR slices (19=IDR_W_RADL, 20=IDR_N_LP)
-    # Trong HEVC bit0 của byte0 là nuh_layer_id_hi (=0), và byte1 có temporal_id=1 (0x01)
-    if h265_type in (19, 20) and (b0 & 0x01 == 0) and b1 == 0x01:
-        return 'h265'
-
-    # 4. H.264 IDR slice (5)
-    if h264_type == 5:
-        return 'h264'
-
-    return None
+    return idr_guess
 
 
 class DahuaCameraViewer:
@@ -565,8 +571,23 @@ class DahuaGPUCameraViewer:
                     # Chưa thấy parameter set (VPS/SPS), đợi tiếp để xác định đúng chuẩn
                     return None, False
             else:
-                # CMS chỉ định rõ H264 hoặc H265 -> tuân thủ 100%
-                self.codec = self.configured_codec
+                # CMS chỉ định H264/H265: dùng ngay, nhưng nếu gói này mang parameter
+                # set của codec KHÁC thì luồng thật mới đúng (CMS khai sai / camera
+                # đổi codec) — tạo decoder sai codec là không bao giờ ra frame.
+                # Chờ parameter set (đi kèm mỗi keyframe) tối đa 50 gói để đối chiếu;
+                # không thấy thì mới tin hẳn CMS.
+                detected = detect_nal_codec(raw_bytes)
+                if detected is None:
+                    self._codec_probe_packets = getattr(self, '_codec_probe_packets', 0) + 1
+                    if self._codec_probe_packets < 50:
+                        return None, False
+                if detected is not None and detected != self.configured_codec:
+                    print(f"[Dahua GPU] WARNING: CMS video_codec={self.configured_codec.upper()} "
+                          f"nhưng luồng thực tế là {detected.upper()} — dùng {detected.upper()}")
+                    self.codec = detected
+                else:
+                    self.codec = self.configured_codec
+                self._codec_probe_packets = 0
 
             print("[Dahua GPU] Lazy init: Loading GPUMotionDetector...")
             from services.motion_detector import GPUMotionDetector

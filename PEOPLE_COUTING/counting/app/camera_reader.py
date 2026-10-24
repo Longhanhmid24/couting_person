@@ -836,27 +836,6 @@ class DahuaAutoReader(BaseCameraReader):
                 self._active_reader = None
 
     def _read_loop(self):
-        if self.codec == 'auto':
-            # AUTO: DahuaGPUReader tự động nhận diện codec H264/H265 từ NAL packet
-            LOGGER.info(f"[{self.cam_name}] Dahua AUTO: dynamic sniffing stream codec (H264/H265) ...")
-            if self._run_with_codec('auto'):
-                return
-            LOGGER.warning(f"[{self.cam_name}] Dahua AUTO: GPU auto probe failed — falling back to Dahua CPU Reader ...")
-            # Fallback to CPU with auto probe
-            cpu_reader = DahuaCPUReader(
-                self.cam_id, self.output_queue, self.shutdown,
-                url=self.url, port=self.port, user=self.user, pwd=self.pwd,
-                channel=self.channel, codec='auto',
-                name=self.cam_name,
-                motion_threshold=self.motion_threshold,
-                motion_alpha=self.motion_alpha,
-                min_motion_pixels=self.min_motion_pixels,
-            )
-            self._active_reader = cpu_reader
-            cpu_reader._read_loop()
-            return
-
-        # Codec cố định (H264 hoặc H265)
         gpu_available = False
         try:
             gpu_available = torch.cuda.is_available()
@@ -865,15 +844,18 @@ class DahuaAutoReader(BaseCameraReader):
 
         force_cpu = getattr(settings, 'FORCE_CPU_DECODE', False)
 
-        # 1. Primary: Dahua GPU Reader
+        # Chế độ GPU: Chỉ được dùng GPU (PyNvVideoCodec NVDEC), retry trên GPU nếu mất luồng
         if gpu_available and not force_cpu:
-            LOGGER.info(f"[{self.cam_name}] Dahua Primary: GPU Reader codec={self.codec} ...")
-            if self._run_with_codec(self.codec):
-                return
-            LOGGER.warning(f"[{self.cam_name}] Dahua GPU codec={self.codec} failed — falling back to CPU Reader...")
+            LOGGER.info(f"[{self.cam_name}] Dahua GPU Reader (NVDEC) bắt đầu — codec={self.codec}")
+            while not self.is_stopped():
+                self._run_with_codec(self.codec)
+                if self.is_stopped():
+                    break
+                time.sleep(2.0)
+            return
 
-        # 2. Fallback: Dahua CPU Reader (FFmpeg)
-        LOGGER.info(f"[{self.cam_name}] Dahua Fallback: CPU Reader codec={self.codec} ...")
+        # Chỉ fallback sang CPU Reader khi ép buộc rõ ràng (FORCE_CPU_DECODE=True) hoặc máy không có GPU
+        LOGGER.warning(f"[{self.cam_name}] Chạy Dahua CPU Reader (FFmpeg) do force_cpu={force_cpu} hoặc gpu_available={gpu_available}")
         cpu_reader = DahuaCPUReader(
             self.cam_id, self.output_queue, self.shutdown,
             url=self.url, port=self.port, user=self.user, pwd=self.pwd,

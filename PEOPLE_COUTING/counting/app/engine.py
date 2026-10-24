@@ -221,6 +221,9 @@ class CentralEngine:
             'storage_username': cam.get('storage_username'),
             'storage_password': cam.get('storage_password'),
             'storage_channel': cam.get('storage_channel'),
+            # H264 / H265 / None(=tự dò). Thiếu key này thì create_reader luôn nhận
+            # 'auto' dù CMS đã cấu hình codec.
+            'video_codec': cam.get('video_codec'),
             # Ưu tiên settings của service (mỗi service tune riêng, ví dụ
             # LITTERING dùng alpha 0.03) rồi mới tới env, thay vì đọc thẳng
             # os.getenv và ghi đè mất giá trị trong core/settings.py.
@@ -248,7 +251,8 @@ class CentralEngine:
             stream_changed = any(
                 cam_config.get(key) != old_config.get(key)
                 for key in ['use_sdk', 'manufacturer', 'url', 'storage_url', 'storage_port',
-                            'storage_username', 'storage_password', 'storage_channel', 'name']
+                            'storage_username', 'storage_password', 'storage_channel', 'name',
+                            'video_codec']
             )
             # Tham số nghiệp vụ (ROI, ngưỡng…) đổi thì chỉ cần nạp lại vào
             # pipeline. Dựng lại reader là mất luôn kết nối RTSP/SDK, mất nền
